@@ -23,7 +23,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import db
-import queue as jobqueue
+import broker as jobqueue
 from auth import require_token
 
 NAS_JOBS_ROOT = os.environ.get("NAS_JOBS_ROOT", "/mnt/vgreens_storage/ai/jobs")
