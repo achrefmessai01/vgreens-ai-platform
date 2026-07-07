@@ -1,0 +1,179 @@
+"""GPU worker consumer loop (systemd template unit vgreens-worker@<GPU_ID>).
+
+Lifecycle per message:
+  1. preflight (NAS, GPU, docker, disk) — fail => nack/requeue + report
+  2. report `running` to the API
+  3. stage dataset NAS -> NVMe (training jobs)
+  4. docker run the job image (contract mounts + env), tee logs to NAS
+  5. exit 0 => copy /out to NAS job folder, report `succeeded` + output_path
+     non-zero => report `failed` + log tail
+  6. always wipe /nvme/jobs/<id>/
+  7. ACK the message ONLY after the report — crash before ack => job requeues
+
+prefetch=1: one job at a time on this GPU.
+Registry/validation (Phase 2) hooks into the success path for training jobs.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import socket
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pika
+import requests
+
+import preflight
+import staging
+import runner
+
+GPU_ID = int(os.environ.get("GPU_ID", "0"))
+API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000")
+API_TOKEN = os.environ.get("API_TOKEN", "")
+NVME_JOBS = os.environ.get("NVME_JOBS", "/nvme/jobs")
+NAS_JOBS_ROOT = os.environ.get("NAS_JOBS_ROOT", "/mnt/vgreens_storage/ai/jobs")
+WORKER_NAME = f"{socket.gethostname()}@{GPU_ID}"
+
+TRAINING_QUEUE = "training_jobs"
+PROCESSING_QUEUE = "processing_jobs"
+
+
+def _params() -> pika.ConnectionParameters:
+    creds = pika.PlainCredentials(
+        os.environ.get("RABBITMQ_USER", "vgreens"),
+        os.environ.get("RABBITMQ_PASSWORD", ""),
+    )
+    return pika.ConnectionParameters(
+        host=os.environ.get("RABBITMQ_HOST", "127.0.0.1"),
+        port=int(os.environ.get("RABBITMQ_PORT", "5672")),
+        credentials=creds,
+        heartbeat=600,
+        blocked_connection_timeout=30,
+    )
+
+
+def _report(job_id: str, status: str, **fields) -> None:
+    payload = {"status": status, "worker": WORKER_NAME, "gpu": GPU_ID, **fields}
+    try:
+        requests.post(
+            f"{API_URL}/jobs/{job_id}/status",
+            json=payload,
+            headers={"Authorization": f"Bearer {API_TOKEN}"},
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        print(f"[worker] WARN: could not report {status} for {job_id}: {exc}", flush=True)
+
+
+def _nas_job_folder(job_id: str) -> Path:
+    year = datetime.now(timezone.utc).strftime("%Y")
+    return Path(NAS_JOBS_ROOT) / year / job_id
+
+
+def _handle(job: dict) -> None:
+    job_id = job["job_id"]
+    nas_folder = _nas_job_folder(job_id)
+    log_path = str(nas_folder / "logs" / "container.log")
+    work = Path(NVME_JOBS) / job_id
+    out_dir = work / "out"
+
+    _report(job_id, "running")
+
+    # stage data for training jobs
+    if job["job_type"] == "training" and job.get("dataset_name"):
+        data_dir = staging.stage_dataset(job["dataset_name"], job["dataset_version"])
+    else:
+        data_dir = str(work / "data")
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+
+    env = {
+        "JOB_ID": job_id,
+        "JOB_TYPE": job["job_type"],
+        "MODEL_NAME": job.get("model_name", ""),
+        "DATASET_VERSION": job.get("dataset_version") or "",
+        "TENANT": job.get("tenant") or "",
+    }
+    config_path = job.get("config_path") or str(work / "job.yaml")
+    if not Path(config_path).exists():
+        Path(config_path).write_text("{}\n")
+
+    code, tail = runner.run_container(
+        image=job["docker_image"],
+        gpu_id=GPU_ID,
+        data_dir=data_dir,
+        config_path=config_path,
+        out_dir=str(out_dir),
+        env=env,
+        log_path=log_path,
+    )
+
+    if code == 0:
+        nas_out = nas_folder / "out"
+        nas_out.mkdir(parents=True, exist_ok=True)
+        if out_dir.exists():
+            shutil.copytree(out_dir, nas_out, dirs_exist_ok=True)
+        # Phase 2: for training jobs, also copy into the model registry + validate.
+        _report(job_id, "succeeded", output_path=str(nas_folder))
+    else:
+        _report(job_id, "failed", error=tail or f"exit code {code}")
+
+    shutil.rmtree(work, ignore_errors=True)
+
+
+def _on_message(ch, method, _properties, body) -> None:
+    try:
+        job = json.loads(body)
+    except json.JSONDecodeError:
+        print("[worker] dropping unparseable message", flush=True)
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        return
+
+    job_id = job.get("job_id", "?")
+    print(f"[worker] received {job_id} ({job.get('job_type')})", flush=True)
+
+    try:
+        preflight.run_all()
+    except preflight.PreflightError as exc:
+        print(f"[worker] preflight failed: {exc} — requeueing", flush=True)
+        _report(job_id, "failed", error=f"preflight: {exc}")
+        time.sleep(5)
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        return
+
+    try:
+        _handle(job)
+    except Exception as exc:  # noqa: BLE001 — report anything, then ack
+        print(f"[worker] job {job_id} crashed: {exc}", flush=True)
+        _report(job_id, "failed", error=str(exc))
+
+    # ack last: if we crash before here, the broker redelivers the job.
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+    print(f"[worker] done {job_id}", flush=True)
+
+
+def main() -> None:
+    print(f"[worker] starting {WORKER_NAME} (GPU {GPU_ID})", flush=True)
+    while True:
+        try:
+            conn = pika.BlockingConnection(_params())
+            ch = conn.channel()
+            ch.queue_declare(queue=TRAINING_QUEUE, durable=True)
+            ch.queue_declare(queue=PROCESSING_QUEUE, durable=True)
+            ch.basic_qos(prefetch_count=1)
+            ch.basic_consume(TRAINING_QUEUE, _on_message)
+            ch.basic_consume(PROCESSING_QUEUE, _on_message)
+            print("[worker] preflight OK … waiting for jobs", flush=True)
+            ch.start_consuming()
+        except pika.exceptions.AMQPConnectionError as exc:
+            print(f"[worker] broker unreachable: {exc} — retry in 5s", flush=True)
+            time.sleep(5)
+        except KeyboardInterrupt:
+            print("[worker] shutting down", flush=True)
+            break
+
+
+if __name__ == "__main__":
+    main()

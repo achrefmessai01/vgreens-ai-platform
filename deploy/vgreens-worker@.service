@@ -1,0 +1,21 @@
+# /etc/systemd/system/vgreens-worker@.service   (template unit, deployed in step 1.5)
+# Enable one instance per GPU:  systemctl enable --now vgreens-worker@0
+# %i -> GPU_ID -> docker --gpus device=%i  (hard GPU pinning; never --gpus all)
+[Unit]
+Description=vGreens GPU worker (GPU %i)
+After=network-online.target docker.service vgreens-ai-api.service mount-nas.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=vgreens
+WorkingDirectory=/opt/vgreens-ai/repo/worker
+EnvironmentFile=/opt/vgreens-ai/.env
+Environment=GPU_ID=%i
+ExecStart=/opt/vgreens-ai/venv/bin/python worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

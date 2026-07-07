@@ -1,0 +1,20 @@
+[project]
+name = "vgreens-ai"
+version = "0.1.0"
+description = "vGreens AI platform CLI — thin client over the Job API"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.15.0",
+    "rich>=13.0.0",
+    "requests>=2.32.0",
+]
+
+[project.scripts]
+vgreens-ai = "vgreens_ai.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["vgreens_ai"]
