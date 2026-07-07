@@ -79,6 +79,7 @@ def _handle(job: dict) -> None:
     log_path = str(nas_folder / "logs" / "container.log")
     work = Path(NVME_JOBS) / job_id
     out_dir = work / "out"
+    work.mkdir(parents=True, exist_ok=True)   # ensure the job workdir exists before we write into it
 
     _report(job_id, "running")
 
