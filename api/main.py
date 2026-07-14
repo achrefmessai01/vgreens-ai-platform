@@ -60,6 +60,15 @@ class StatusUpdate(BaseModel):
     result_version: Optional[str] = None
 
 
+class LockAcquire(BaseModel):
+    holder: str
+    job_id: str
+
+
+class LockRelease(BaseModel):
+    job_id: str
+
+
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
@@ -160,6 +169,24 @@ def report_status(job_id: str, upd: StatusUpdate, _: str = Depends(require_token
         result_version=upd.result_version,
     )
     return {"job_id": job_id, "status": upd.status}
+
+
+@app.post("/locks/{name}/acquire")
+def acquire_lock(name: str, body: LockAcquire, _: str = Depends(require_token)) -> dict:
+    """Take a named resource lock (e.g. 'training'). Returns whether it was granted."""
+    granted = db.acquire_lock(name, body.holder, body.job_id)
+    return {"lock": name, "acquired": granted}
+
+
+@app.post("/locks/{name}/release")
+def release_lock(name: str, body: LockRelease, _: str = Depends(require_token)) -> dict:
+    released = db.release_lock(name, body.job_id)
+    return {"lock": name, "released": released}
+
+
+@app.get("/locks/{name}")
+def read_lock(name: str, _: str = Depends(require_token)) -> dict:
+    return db.get_lock(name) or {"lock": name, "held": False}
 
 
 @app.get("/health")

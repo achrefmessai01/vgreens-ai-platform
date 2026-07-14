@@ -39,6 +39,8 @@ WORKER_NAME = f"{socket.gethostname()}@{GPU_ID}"
 
 TRAINING_QUEUE = "training_jobs"
 PROCESSING_QUEUE = "processing_jobs"
+TRAINING_LOCK = "training"           # max one training at a time (keeps a GPU free for production)
+LOCK_RETRY_SLEEP = 5                 # seconds to wait before requeueing a blocked training job
 
 
 def _params() -> pika.ConnectionParameters:
@@ -66,6 +68,34 @@ def _report(job_id: str, status: str, **fields) -> None:
         )
     except requests.RequestException as exc:
         print(f"[worker] WARN: could not report {status} for {job_id}: {exc}", flush=True)
+
+
+def _acquire_lock(name: str, job_id: str) -> bool:
+    """Ask the API for a resource lock. Fail-closed: if the API can't be reached,
+    treat it as 'not acquired' so we don't run two trainings by accident."""
+    try:
+        r = requests.post(
+            f"{API_URL}/locks/{name}/acquire",
+            json={"holder": WORKER_NAME, "job_id": job_id},
+            headers={"Authorization": f"Bearer {API_TOKEN}"},
+            timeout=15,
+        )
+        return bool(r.ok and r.json().get("acquired"))
+    except requests.RequestException as exc:
+        print(f"[worker] WARN: lock acquire failed ({name}): {exc}", flush=True)
+        return False
+
+
+def _release_lock(name: str, job_id: str) -> None:
+    try:
+        requests.post(
+            f"{API_URL}/locks/{name}/release",
+            json={"job_id": job_id},
+            headers={"Authorization": f"Bearer {API_TOKEN}"},
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        print(f"[worker] WARN: lock release failed ({name}): {exc}", flush=True)
 
 
 def _nas_job_folder(job_id: str) -> Path:
@@ -144,11 +174,23 @@ def _on_message(ch, method, _properties, body) -> None:
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
         return
 
+    # Training lock: only ONE training runs platform-wide, so a GPU always stays
+    # free for production. Processing jobs skip the lock entirely.
+    is_training = job.get("job_type") == "training"
+    if is_training and not _acquire_lock(TRAINING_LOCK, job_id):
+        print(f"[worker] training busy elsewhere — requeueing {job_id}", flush=True)
+        time.sleep(LOCK_RETRY_SLEEP)
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        return
+
     try:
         _handle(job)
     except Exception as exc:  # noqa: BLE001 — report anything, then ack
         print(f"[worker] job {job_id} crashed: {exc}", flush=True)
         _report(job_id, "failed", error=str(exc))
+    finally:
+        if is_training:
+            _release_lock(TRAINING_LOCK, job_id)
 
     # ack last: if we crash before here, the broker redelivers the job.
     ch.basic_ack(delivery_tag=method.delivery_tag)

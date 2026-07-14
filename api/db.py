@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_model  ON jobs(model_name);
+
+CREATE TABLE IF NOT EXISTS locks (
+    name        TEXT PRIMARY KEY,   -- e.g. "training"
+    holder      TEXT,               -- worker name that holds it
+    job_id      TEXT,               -- job currently holding it
+    acquired_at TEXT
+);
 """
 
 
@@ -130,3 +137,66 @@ def count_by_status() -> dict:
             "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
         ).fetchall()
         return {r["status"]: r["n"] for r in rows}
+
+
+# --------------------------------------------------------------------------- #
+# resource locks (e.g. the training lock: max one training at a time so a GPU
+# always stays free for production)
+# --------------------------------------------------------------------------- #
+def _lock_conn() -> sqlite3.Connection:
+    # autocommit mode (isolation_level=None) so we can drive BEGIN IMMEDIATE
+    # ourselves — that takes the write lock up front and makes acquire atomic
+    # even when both workers ask at the same moment.
+    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+
+def acquire_lock(name: str, holder: str, job_id: str) -> bool:
+    """Try to take the named lock. Returns True on success.
+
+    A lock is considered free if nobody holds it, or if the previous holder's
+    job is no longer active (crashed/finished without releasing) — that makes
+    the lock self-healing so a dead worker can't wedge it forever.
+    """
+    conn = _lock_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        row = conn.execute("SELECT job_id FROM locks WHERE name = ?", (name,)).fetchone()
+        if row is not None:
+            held = conn.execute(
+                "SELECT status FROM jobs WHERE job_id = ?", (row["job_id"],)
+            ).fetchone()
+            if held is not None and held["status"] in ("queued", "running"):
+                conn.execute("COMMIT;")
+                return False  # someone active still holds it
+            # else: stale holder -> fall through and take over
+        conn.execute(
+            "INSERT INTO locks(name, holder, job_id, acquired_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET holder=excluded.holder, "
+            "job_id=excluded.job_id, acquired_at=excluded.acquired_at",
+            (name, holder, job_id, now_iso()),
+        )
+        conn.execute("COMMIT;")
+        return True
+    finally:
+        conn.close()
+
+
+def release_lock(name: str, job_id: str) -> bool:
+    """Release the lock only if this job_id still holds it."""
+    conn = _lock_conn()
+    try:
+        cur = conn.execute(
+            "DELETE FROM locks WHERE name = ? AND job_id = ?", (name, job_id)
+        )
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_lock(name: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM locks WHERE name = ?", (name,)).fetchone()
+        return dict(row) if row else None
