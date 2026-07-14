@@ -75,6 +75,10 @@ services:
     image: utkuozdemir/nvidia_gpu_exporter:1.2.0
     container_name: vgreens-gpu-exporter
     restart: unless-stopped
+    # AUTO field discovery panics on driver 595 (invalid metric names from
+    # clocks_event_reasons.* [us]); query an explicit, known-good field set.
+    command:
+      - '--query-field-names=utilization.gpu,utilization.memory,memory.total,memory.used,memory.free,temperature.gpu,power.draw,fan.speed,name'
     deploy:
       resources:
         reservations:
