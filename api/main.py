@@ -19,7 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Gauge, generate_latest
 from pydantic import BaseModel, Field
 
 import db
@@ -232,6 +233,18 @@ def rollback_model(model: str, body: RollbackBody, who: str = Depends(require_to
         return reg.rollback(model, body.to, who, body.reason)
     except reg.RegistryError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    """Prometheus metrics. Unauthenticated on purpose (operational, LAN-only)."""
+    reg = CollectorRegistry()
+    jobs = Gauge("vgreens_jobs", "Jobs by status", ["status"], registry=reg)
+    for status, n in db.count_by_status().items():
+        jobs.labels(status=status).set(n)
+    nas = Gauge("vgreens_nas_mounted", "NAS mounted (1) or not (0)", registry=reg)
+    nas.set(1 if os.path.ismount(NAS_MOUNTPOINT) else 0)
+    return Response(generate_latest(reg), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health")

@@ -1,0 +1,66 @@
+{
+  "uid": "vgreens-platform",
+  "title": "vGreens AI Platform",
+  "tags": ["vgreens"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {
+      "type": "stat", "title": "Job API", "id": 1,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"mappings": [
+        {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}}
+      ], "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "up{job=\"vgreens-api\"}", "refId": "A"}]
+    },
+    {
+      "type": "stat", "title": "NAS mounted", "id": 2,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "fieldConfig": {"defaults": {"mappings": [
+        {"type": "value", "options": {"0": {"text": "NO", "color": "red"}, "1": {"text": "YES", "color": "green"}}}
+      ], "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "vgreens_nas_mounted", "refId": "A"}]
+    },
+    {
+      "type": "stat", "title": "Monitored targets up", "id": 3,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "sum(up)", "refId": "A"}]
+    },
+    {
+      "type": "gauge", "title": "Root disk used %", "id": 4,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "thresholds": {"steps": [
+        {"color": "green", "value": null}, {"color": "orange", "value": 75}, {"color": "red", "value": 85}]}}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"},
+        "expr": "100 * (1 - (node_filesystem_avail_bytes{mountpoint=\"/host\",fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/host\",fstype!~\"tmpfs|overlay\"}))", "refId": "A"}]
+    },
+    {
+      "type": "timeseries", "title": "Jobs by status", "id": 5,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "vgreens_jobs", "legendFormat": "{{status}}", "refId": "A"}]
+    },
+    {
+      "type": "timeseries", "title": "Host CPU usage %", "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"},
+        "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])))", "legendFormat": "cpu", "refId": "A"}]
+    },
+    {
+      "type": "timeseries", "title": "Host memory used %", "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"},
+        "expr": "100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))", "legendFormat": "mem", "refId": "A"}]
+    },
+    {
+      "type": "timeseries", "title": "Scrape target up (1=up)", "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "up", "legendFormat": "{{job}}", "refId": "A"}]
+    }
+  ]
+}

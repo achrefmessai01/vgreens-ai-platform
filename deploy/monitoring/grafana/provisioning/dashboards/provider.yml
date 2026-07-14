@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: vgreens
+    orgId: 1
+    folder: vGreens
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
