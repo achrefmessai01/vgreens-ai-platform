@@ -127,6 +127,56 @@ def list_jobs(
     console.print(table)
 
 
+@app.command()
+def models(model: str = typer.Option(None, help="model name; omit to list all models")):
+    """List models, or versions of one model (marking the active one)."""
+    if not model:
+        res = _request("GET", "/models")
+        table = Table(title="models")
+        table.add_column("model")
+        for m in res.get("models", []):
+            table.add_row(m)
+        console.print(table)
+        return
+
+    versions = _request("GET", f"/models/{model}/versions")
+    table = Table(title=f"{model} — versions")
+    for col in ("version", "status", "active"):
+        table.add_column(col)
+    for v in versions:
+        table.add_row(
+            v["version"],
+            v.get("status") or "-",
+            "★ active" if v.get("active") else "",
+        )
+    console.print(table)
+
+
+@app.command()
+def promote(
+    model: str = typer.Option(..., help="model name"),
+    version: str = typer.Option(..., help="version to promote (must be validated)"),
+    reason: str = typer.Option(None, help="why (recorded in the audit log)"),
+):
+    """Promote a validated version to production."""
+    res = _request("POST", f"/models/{model}/promote",
+                   json={"version": version, "reason": reason})
+    console.print(f"[green]promoted[/green] {model} -> {res['active_version']}"
+                  f" (was {res.get('previous_stable') or 'none'})")
+
+
+@app.command()
+def rollback(
+    model: str = typer.Option(..., help="model name"),
+    to: str = typer.Option(None, "--to", help="version to roll back to (default: previous stable)"),
+    reason: str = typer.Option(None, help="why (recorded in the audit log)"),
+):
+    """Roll production back to the previous stable version (or an explicit one)."""
+    res = _request("POST", f"/models/{model}/rollback",
+                   json={"to": to, "reason": reason})
+    console.print(f"[yellow]rolled back[/yellow] {model} -> {res['active_version']}")
+
+
 def main() -> None:
     app()
 

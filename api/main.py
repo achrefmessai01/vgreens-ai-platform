@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 import db
 import broker as jobqueue
+import models_registry as reg
 from auth import require_token
 
 NAS_JOBS_ROOT = os.environ.get("NAS_JOBS_ROOT", "/mnt/vgreens_storage/ai/jobs")
@@ -67,6 +68,16 @@ class LockAcquire(BaseModel):
 
 class LockRelease(BaseModel):
     job_id: str
+
+
+class PromoteBody(BaseModel):
+    version: str
+    reason: Optional[str] = None
+
+
+class RollbackBody(BaseModel):
+    to: Optional[str] = None
+    reason: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +198,40 @@ def release_lock(name: str, body: LockRelease, _: str = Depends(require_token)) 
 @app.get("/locks/{name}")
 def read_lock(name: str, _: str = Depends(require_token)) -> dict:
     return db.get_lock(name) or {"lock": name, "held": False}
+
+
+# --------------------------------------------------------------------------- #
+# model registry — promote / rollback (production control)
+# --------------------------------------------------------------------------- #
+@app.get("/models")
+def list_models(_: str = Depends(require_token)) -> dict:
+    return {"models": reg.list_models()}
+
+
+@app.get("/models/{model}/versions")
+def list_versions(model: str, _: str = Depends(require_token)) -> list[dict]:
+    return reg.list_versions(model)
+
+
+@app.get("/models/{model}/active")
+def active_model(model: str, _: str = Depends(require_token)) -> dict:
+    return reg.get_active(model) or {"model": model, "active_version": None}
+
+
+@app.post("/models/{model}/promote")
+def promote_model(model: str, body: PromoteBody, who: str = Depends(require_token)) -> dict:
+    try:
+        return reg.promote(model, body.version, who, body.reason)
+    except reg.RegistryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/models/{model}/rollback")
+def rollback_model(model: str, body: RollbackBody, who: str = Depends(require_token)) -> dict:
+    try:
+        return reg.rollback(model, body.to, who, body.reason)
+    except reg.RegistryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @app.get("/health")
