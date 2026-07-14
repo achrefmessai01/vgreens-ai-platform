@@ -4,6 +4,7 @@
 FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
 
 WORKDIR /app
+RUN pip install --no-cache-dir pyyaml==6.0.2
 COPY run.py /app/run.py
 
 # The platform provides the contract mounts (/data ro, /config/job.yaml ro, /out rw)

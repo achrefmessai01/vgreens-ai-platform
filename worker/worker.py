@@ -29,6 +29,7 @@ import requests
 import preflight
 import staging
 import runner
+import registry
 
 GPU_ID = int(os.environ.get("GPU_ID", "0"))
 API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000")
@@ -131,6 +132,7 @@ def _handle(job: dict) -> None:
     if not Path(config_path).exists():
         Path(config_path).write_text("{}\n")
 
+    t0 = time.time()
     code, tail = runner.run_container(
         image=job["docker_image"],
         gpu_id=GPU_ID,
@@ -140,14 +142,29 @@ def _handle(job: dict) -> None:
         env=env,
         log_path=log_path,
     )
+    duration = time.time() - t0
 
     if code == 0:
         nas_out = nas_folder / "out"
         nas_out.mkdir(parents=True, exist_ok=True)
         if out_dir.exists():
             shutil.copytree(out_dir, nas_out, dirs_exist_ok=True)
-        # Phase 2: for training jobs, also copy into the model registry + validate.
-        _report(job_id, "succeeded", output_path=str(nas_folder))
+
+        # Training jobs: publish to the model registry + run the validation gate.
+        result_version = None
+        if job["job_type"] == "training":
+            summary = registry.publish(
+                job, out_dir, config_path, GPU_ID, WORKER_NAME, duration
+            )
+            result_version = summary["version"]
+            extra = f" ({summary['reason']})" if summary.get("reason") else ""
+            print(
+                f"[worker] registry: {job['model_name']} {summary['version']} "
+                f"-> {summary['status']}{extra}",
+                flush=True,
+            )
+        _report(job_id, "succeeded", output_path=str(nas_folder),
+                result_version=result_version)
     else:
         _report(job_id, "failed", error=tail or f"exit code {code}")
 
