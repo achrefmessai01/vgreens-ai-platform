@@ -41,6 +41,14 @@ groups:
           summary: "Host node-exporter down"
           description: "Host metrics are not being collected."
 
+      - alert: GPUTemperatureHigh
+        expr: nvidia_smi_temperature_gpu > 85
+        for: 3m
+        labels: {severity: warning}
+        annotations:
+          summary: "GPU running hot (>85°C)"
+          description: "A GPU has been above 85°C for 3 minutes — check cooling / job load."
+
       - alert: DiskAlmostFull
         expr: (node_filesystem_avail_bytes{mountpoint="/host",fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{mountpoint="/host",fstype!~"tmpfs|overlay"}) < 0.15
         for: 5m
