@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import json
 import secrets
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -167,6 +168,31 @@ def read_jobs(
     return db.list_jobs(status=status, model=model, limit=limit)
 
 
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, who: str = Depends(require_token)) -> dict:
+    """Best-effort cancel: mark the job cancelled and kill its container if running."""
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job["status"] in ("succeeded", "failed", "cancelled"):
+        return {"job_id": job_id, "status": job["status"], "note": "already finished"}
+
+    db.update_status(job_id, "cancelled", error=f"cancelled by {who}")
+    # kill the container if it's running (named vgreens-job-<id>); ignore if absent
+    try:
+        subprocess.run(["docker", "kill", f"vgreens-job-{job_id}"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+    except Exception:
+        pass
+    return {"job_id": job_id, "status": "cancelled"}
+
+
+@app.post("/workers/{name}/heartbeat")
+def worker_heartbeat(name: str, _: str = Depends(require_token)) -> dict:
+    db.heartbeat(name)
+    return {"worker": name, "ok": True}
+
+
 @app.post("/jobs/{job_id}/status")
 def report_status(job_id: str, upd: StatusUpdate, _: str = Depends(require_token)) -> dict:
     if db.get_job(job_id) is None:
@@ -244,6 +270,17 @@ def metrics() -> Response:
         jobs.labels(status=status).set(n)
     nas = Gauge("vgreens_nas_mounted", "NAS mounted (1) or not (0)", registry=reg)
     nas.set(1 if os.path.ismount(NAS_MOUNTPOINT) else 0)
+
+    # seconds since each worker last checked in (drives the worker-stopped alert)
+    age = Gauge("vgreens_worker_seconds_since_heartbeat",
+                "Seconds since the worker last sent a heartbeat", ["worker"], registry=reg)
+    now = datetime.now(timezone.utc)
+    for w in db.list_workers():
+        try:
+            last = datetime.fromisoformat(w["last_seen"])
+            age.labels(worker=w["name"]).set((now - last).total_seconds())
+        except (TypeError, ValueError):
+            pass
     return Response(generate_latest(reg), media_type=CONTENT_TYPE_LATEST)
 
 

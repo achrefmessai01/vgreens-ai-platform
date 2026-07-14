@@ -1,0 +1,10 @@
+# /etc/systemd/system/vgreens-nvme-evict.timer
+[Unit]
+Description=Check NVMe free space every 15 min and evict LRU cache if low
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target

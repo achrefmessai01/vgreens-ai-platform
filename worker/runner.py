@@ -33,8 +33,10 @@ def run_container(
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
 
+    container_name = f"vgreens-job-{env.get('JOB_ID', 'unknown')}"
     cmd = [
         "docker", "run", "--rm",
+        "--name", container_name,      # so `cancel` can `docker kill` it
         f"--gpus", f"device={gpu_id}",
         "--shm-size", SHM_SIZE,
         "-v", f"{data_dir}:/data:ro",

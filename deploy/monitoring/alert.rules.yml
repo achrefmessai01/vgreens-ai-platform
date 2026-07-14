@@ -41,6 +41,14 @@ groups:
           summary: "Host node-exporter down"
           description: "Host metrics are not being collected."
 
+      - alert: WorkerStopped
+        expr: vgreens_worker_seconds_since_heartbeat > 90
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "GPU worker {{ $labels.worker }} stopped checking in"
+          description: "No heartbeat from {{ $labels.worker }} for over 90s — the worker may be down."
+
       - alert: GPUTemperatureHigh
         expr: nvidia_smi_temperature_gpu > 85
         for: 3m

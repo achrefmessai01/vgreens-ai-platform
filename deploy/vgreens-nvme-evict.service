@@ -1,0 +1,8 @@
+# /etc/systemd/system/vgreens-nvme-evict.service
+[Unit]
+Description=Evict LRU entries from the NVMe cache when low on space
+
+[Service]
+Type=oneshot
+User=vgreens
+ExecStart=/opt/vgreens-ai/repo/deploy/scripts/nvme-evict.sh

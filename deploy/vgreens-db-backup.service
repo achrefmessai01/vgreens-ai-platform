@@ -1,0 +1,10 @@
+# /etc/systemd/system/vgreens-db-backup.service
+[Unit]
+Description=Backup vGreens jobs.db to the NAS
+After=mount-nas.service network-online.target
+Wants=mount-nas.service
+
+[Service]
+Type=oneshot
+User=vgreens
+ExecStart=/opt/vgreens-ai/repo/deploy/scripts/backup-jobs-db.sh

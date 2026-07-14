@@ -1,0 +1,10 @@
+# /etc/systemd/system/vgreens-db-backup.timer
+[Unit]
+Description=Nightly vGreens jobs.db backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

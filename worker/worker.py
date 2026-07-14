@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import socket
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,8 @@ TRAINING_QUEUE = "training_jobs"
 PROCESSING_QUEUE = "processing_jobs"
 TRAINING_LOCK = "training"           # max one training at a time (keeps a GPU free for production)
 LOCK_RETRY_SLEEP = 5                 # seconds to wait before requeueing a blocked training job
+MAX_PREFLIGHT_ATTEMPTS = 3           # delivery limit: give up after this many preflight failures
+HEARTBEAT_SECONDS = 30               # how often to check in with the API (worker-stopped alert)
 
 
 def _params() -> pika.ConnectionParameters:
@@ -70,6 +73,20 @@ def _report(job_id: str, status: str, **fields) -> None:
         )
     except requests.RequestException as exc:
         print(f"[worker] WARN: could not report {status} for {job_id}: {exc}", flush=True)
+
+
+def _heartbeat_loop() -> None:
+    """Check in with the API so a stopped worker can be detected/alerted."""
+    while True:
+        try:
+            requests.post(
+                f"{API_URL}/workers/{WORKER_NAME}/heartbeat",
+                headers={"Authorization": f"Bearer {API_TOKEN}"},
+                timeout=10,
+            )
+        except requests.RequestException:
+            pass
+        time.sleep(HEARTBEAT_SECONDS)
 
 
 def _acquire_lock(name: str, job_id: str) -> bool:
@@ -200,7 +217,7 @@ def _handle(job: dict) -> None:
     shutil.rmtree(work, ignore_errors=True)
 
 
-def _on_message(ch, method, _properties, body) -> None:
+def _on_message(ch, method, properties, body) -> None:
     try:
         job = json.loads(body)
     except json.JSONDecodeError:
@@ -214,10 +231,24 @@ def _on_message(ch, method, _properties, body) -> None:
     try:
         preflight.run_all()
     except preflight.PreflightError as exc:
-        print(f"[worker] preflight failed: {exc} — requeueing", flush=True)
-        _report(job_id, "failed", error=f"preflight: {exc}")
-        time.sleep(5)
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        # Delivery limit: bound retries so a persistent failure (e.g. NAS down)
+        # can't loop forever. After MAX_PREFLIGHT_ATTEMPTS, give up (dead-letter).
+        headers = (properties.headers or {}) if properties else {}
+        attempts = int(headers.get("x-attempts", 0)) + 1
+        if attempts >= MAX_PREFLIGHT_ATTEMPTS:
+            print(f"[worker] preflight failed {attempts}x — giving up {job_id}: {exc}", flush=True)
+            _report(job_id, "failed", error=f"preflight failed {attempts}x: {exc}")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+        else:
+            print(f"[worker] preflight failed ({exc}) — retry {attempts}/{MAX_PREFLIGHT_ATTEMPTS}", flush=True)
+            ch.basic_publish(
+                exchange="", routing_key=method.routing_key, body=body,
+                properties=pika.BasicProperties(
+                    delivery_mode=2, content_type="application/json",
+                    headers={"x-attempts": attempts}),
+            )
+            time.sleep(5)
+            ch.basic_ack(delivery_tag=method.delivery_tag)
         return
 
     # Training lock: only ONE training runs platform-wide, so a GPU always stays
@@ -245,6 +276,7 @@ def _on_message(ch, method, _properties, body) -> None:
 
 def main() -> None:
     print(f"[worker] starting {WORKER_NAME} (GPU {GPU_ID})", flush=True)
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
     while True:
         try:
             conn = pika.BlockingConnection(_params())

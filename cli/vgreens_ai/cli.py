@@ -177,6 +177,14 @@ def rollback(
     console.print(f"[yellow]rolled back[/yellow] {model} -> {res['active_version']}")
 
 
+@app.command()
+def cancel(job_id: str = typer.Option(..., "--job-id", help="job to cancel")):
+    """Cancel a job (best-effort: kills the running container, marks cancelled)."""
+    res = _request("POST", f"/jobs/{job_id}/cancel")
+    note = f" ({res['note']})" if res.get("note") else ""
+    console.print(f"[yellow]{res['status']}[/yellow] {job_id}{note}")
+
+
 def main() -> None:
     app()
 

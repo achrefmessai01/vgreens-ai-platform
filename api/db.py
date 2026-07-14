@@ -45,7 +45,14 @@ CREATE TABLE IF NOT EXISTS locks (
     job_id      TEXT,               -- job currently holding it
     acquired_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS workers (
+    name       TEXT PRIMARY KEY,    -- e.g. gpu-worker-01@0
+    last_seen  TEXT
+);
 """
+
+TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
 
 
 def now_iso() -> str:
@@ -113,7 +120,14 @@ def update_status(job_id: str, status: str, **fields) -> bool:
     """Update job status plus optional worker/gpu/error/output_path/result_version.
 
     Stamps started_at/finished_at automatically on the relevant transitions.
+    A 'cancelled' job is terminal: later reports (e.g. a worker's 'failed' after
+    its container was killed) must not override it.
     """
+    with _connect() as conn:
+        row = conn.execute("SELECT status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if row is not None and row["status"] == "cancelled" and status != "cancelled":
+            return False
+
     sets = {"status": status}
     if status == "running":
         sets["started_at"] = now_iso()
@@ -200,3 +214,21 @@ def get_lock(name: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM locks WHERE name = ?", (name,)).fetchone()
         return dict(row) if row else None
+
+
+# --------------------------------------------------------------------------- #
+# worker heartbeats (for the worker-stopped alert)
+# --------------------------------------------------------------------------- #
+def heartbeat(name: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO workers(name, last_seen) VALUES(?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET last_seen = excluded.last_seen",
+            (name, now_iso()),
+        )
+
+
+def list_workers() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT name, last_seen FROM workers").fetchall()
+        return [dict(r) for r in rows]
