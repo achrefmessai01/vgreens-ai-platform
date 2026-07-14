@@ -9,8 +9,13 @@ stdout/stderr are teed to the NAS job log. Returns (exit_code, log_tail).
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
+
+# PyTorch DataLoaders use shared memory; Docker's default /dev/shm (64 MB) is far
+# too small and crashes workers with a Bus error. Give containers a real allowance.
+SHM_SIZE = os.environ.get("SHM_SIZE", "8g")
 
 
 def run_container(
@@ -30,6 +35,7 @@ def run_container(
     cmd = [
         "docker", "run", "--rm",
         f"--gpus", f"device={gpu_id}",
+        "--shm-size", SHM_SIZE,
         "-v", f"{data_dir}:/data:ro",
         "-v", f"{config_path}:/config/job.yaml:ro",
         "-v", f"{out_dir}:/out",
