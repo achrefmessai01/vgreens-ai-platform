@@ -27,6 +27,7 @@ def run_container(
     out_dir: str,
     env: dict[str, str],
     log_path: str,
+    model_dir: str | None = None,
     timeout_s: int = 24 * 3600,
 ) -> tuple[int, str]:
     Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -40,6 +41,8 @@ def run_container(
         "-v", f"{config_path}:/config/job.yaml:ro",
         "-v", f"{out_dir}:/out",
     ]
+    if model_dir:  # processing jobs get the active model mounted read-only
+        cmd += ["-v", f"{model_dir}:/model:ro"]
     for key, value in env.items():
         cmd += ["-e", f"{key}={value}"]
     cmd.append(image)

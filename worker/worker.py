@@ -36,6 +36,7 @@ API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000")
 API_TOKEN = os.environ.get("API_TOKEN", "")
 NVME_JOBS = os.environ.get("NVME_JOBS", "/nvme/jobs")
 NAS_JOBS_ROOT = os.environ.get("NAS_JOBS_ROOT", "/mnt/vgreens_storage/ai/jobs")
+NAS_MODEL_REGISTRY = os.environ.get("NAS_MODEL_REGISTRY", "/mnt/vgreens_storage/ai/model_registry")
 WORKER_NAME = f"{socket.gethostname()}@{GPU_ID}"
 
 TRAINING_QUEUE = "training_jobs"
@@ -104,6 +105,22 @@ def _nas_job_folder(job_id: str) -> Path:
     return Path(NAS_JOBS_ROOT) / year / job_id
 
 
+def _active_model_dir(model_name: str) -> tuple[Path | None, str | None]:
+    """Resolve the active version for a model from active.json in the registry.
+    Returns (version_dir, version) or (None, None) if nothing is promoted."""
+    active = Path(NAS_MODEL_REGISTRY) / model_name / "active.json"
+    if not active.is_file():
+        return None, None
+    try:
+        version = json.loads(active.read_text()).get("active_version")
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not version:
+        return None, None
+    vdir = Path(NAS_MODEL_REGISTRY) / model_name / "versions" / version
+    return (vdir, version) if vdir.is_dir() else (None, None)
+
+
 def _handle(job: dict) -> None:
     job_id = job["job_id"]
     nas_folder = _nas_job_folder(job_id)
@@ -114,17 +131,28 @@ def _handle(job: dict) -> None:
 
     _report(job_id, "running")
 
-    # stage data for training jobs
-    if job["job_type"] == "training" and job.get("dataset_name"):
+    # stage the dataset (any job that names one — training data or images to process)
+    if job.get("dataset_name"):
         data_dir = staging.stage_dataset(job["dataset_name"], job["dataset_version"])
     else:
         data_dir = str(work / "data")
         Path(data_dir).mkdir(parents=True, exist_ok=True)
 
+    # processing jobs serve the ACTIVE promoted model (mounted read-only at /model)
+    model_dir = None
+    model_version = None
+    if job["job_type"] == "processing":
+        mdir, model_version = _active_model_dir(job["model_name"])
+        if mdir is None:
+            raise RuntimeError(f"no active (promoted) model for '{job['model_name']}'")
+        model_dir = str(mdir)
+        print(f"[worker] serving {job['model_name']} active version {model_version}", flush=True)
+
     env = {
         "JOB_ID": job_id,
         "JOB_TYPE": job["job_type"],
         "MODEL_NAME": job.get("model_name", ""),
+        "MODEL_VERSION": model_version or "",
         "DATASET_VERSION": job.get("dataset_version") or "",
         "TENANT": job.get("tenant") or "",
     }
@@ -141,6 +169,7 @@ def _handle(job: dict) -> None:
         out_dir=str(out_dir),
         env=env,
         log_path=log_path,
+        model_dir=model_dir,
     )
     duration = time.time() - t0
 
