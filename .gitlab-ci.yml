@@ -1,0 +1,18 @@
+# CI for the platform code (api / worker / cli). Lint + compile checks only —
+# the platform is never built into a GPU image and CI never touches the GPUs.
+stages: [lint, test]
+
+lint:
+  stage: lint
+  image: python:3.12-slim
+  script:
+    - pip install --quiet ruff
+    - ruff check api worker cli
+  allow_failure: true
+
+compile:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - python -m py_compile api/*.py worker/*.py cli/vgreens_ai/*.py
+    - echo "syntax OK"

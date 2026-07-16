@@ -1,193 +1,534 @@
-"""vgreens-ai — thin typer CLI over the Job API.
+"""vgreens-ai — command-line client for the vGreens AI platform.
 
-Zero business logic: every command is one HTTP call + pretty print. All rules
-live in the API so the CLI and reality can't drift apart.
-
-Commands (Phase 1): train, process, status, list-jobs.
-Later phases add: logs, models, promote, rollback, datasets, cancel.
+Thin client: every command is an HTTP call to the Job API + formatting. No business
+logic lives here. Global options set the profile/output; commands are grouped under
+job / model / worker / gpu / system / config, with backward-compatible top-level
+aliases (train, process, status, list-jobs, models, promote, rollback, cancel).
 """
 from __future__ import annotations
 
+import socket
 import sys
+import time
+from dataclasses import dataclass
+from typing import Optional
+from urllib.parse import urlparse
 
-import requests
 import typer
-from rich.console import Console
-from rich.table import Table
 
-from . import config
+from . import __version__, config, output
+from .client import CLIError, Client, EXIT_GENERIC
 
-app = typer.Typer(add_completion=False, help="vGreens AI platform CLI")
-console = Console()
+app = typer.Typer(add_completion=True, no_args_is_help=True,
+                  help="vGreens AI platform CLI. Run `vgreens-ai config init` to get started.")
+job_app = typer.Typer(no_args_is_help=True, help="Submit and inspect jobs.")
+model_app = typer.Typer(no_args_is_help=True, help="Model registry: versions, promote, rollback.")
+worker_app = typer.Typer(no_args_is_help=True, help="GPU workers.")
+gpu_app = typer.Typer(no_args_is_help=True, help="GPUs.")
+system_app = typer.Typer(no_args_is_help=True, help="Platform health and diagnostics.")
+config_app = typer.Typer(no_args_is_help=True, help="CLI configuration and profiles.")
+dataset_app = typer.Typer(no_args_is_help=True, help="Datasets (where the server supports it).")
+app.add_typer(job_app, name="job")
+app.add_typer(model_app, name="model")
+app.add_typer(worker_app, name="worker")
+app.add_typer(gpu_app, name="gpu")
+app.add_typer(system_app, name="system")
+app.add_typer(config_app, name="config")
+app.add_typer(dataset_app, name="dataset")
 
 
-def _headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}"}
+@dataclass
+class G:
+    profile: Optional[str]
+    api_url: Optional[str]
+    token: Optional[str]
+    output: str
+    no_color: bool
+    quiet: bool
+    verbose: bool
+    timeout: float
 
 
-def _die(msg: str) -> None:
-    console.print(f"[red]error:[/red] {msg}")
-    raise SystemExit(1)
+def _version_cb(value: bool):
+    if value:
+        print(f"vgreens-ai {__version__}")
+        raise typer.Exit()
 
 
-def _request(method: str, path: str, **kwargs) -> dict | list:
-    api_url, token = config.load()
+@app.callback()
+def _main(
+    ctx: typer.Context,
+    profile: Optional[str] = typer.Option(None, "--profile", "-p", help="config profile to use"),
+    api_url: Optional[str] = typer.Option(None, "--api-url", help="override the API base URL"),
+    token: Optional[str] = typer.Option(None, "--token", help="override the API token"),
+    output_fmt: str = typer.Option("table", "--output", "-o", help="table | json | yaml"),
+    no_color: bool = typer.Option(False, "--no-color", help="disable colour"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="suppress spinners/messages"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="extra detail"),
+    timeout: float = typer.Option(30.0, "--timeout", help="HTTP timeout (s)"),
+    _version: bool = typer.Option(False, "--version", callback=_version_cb, is_eager=True,
+                                  help="show CLI version and exit"),
+):
+    if output_fmt not in ("table", "json", "yaml"):
+        raise CLIError("--output must be one of: table, json, yaml", 2)
+    nc = no_color or not sys.stdout.isatty()   # auto-disable colour when piped
+    output.configure(nc)
+    ctx.obj = G(profile, api_url, token, output_fmt, nc, quiet, verbose, timeout)
+
+
+def _client(ctx: typer.Context) -> Client:
+    g: G = ctx.obj
     try:
-        resp = requests.request(
-            method, f"{api_url}{path}", headers=_headers(token), timeout=30, **kwargs
-        )
-    except requests.RequestException as exc:
-        _die(f"cannot reach API at {api_url}: {exc}")
-    if resp.status_code >= 400:
-        detail = resp.json().get("detail", resp.text) if resp.content else resp.reason
-        _die(f"{resp.status_code}: {detail}")
-    return resp.json()
+        url, tok, _name = config.resolve(g.profile, g.api_url, g.token)
+    except config.ConfigError as exc:
+        raise CLIError(str(exc), EXIT_GENERIC)
+    return Client(url, tok, timeout=g.timeout, quiet=g.quiet)
 
 
-@app.command()
-def train(
-    model: str = typer.Option(..., help="model name, e.g. dummy"),
-    dataset: str = typer.Option(..., help="dataset as name:version, e.g. test:v1"),
-    image: str = typer.Option("vgreens/dummy-job:v1", help="docker image for the job"),
-    tenant: str = typer.Option(None, help="tenant tag"),
-    config_path: str = typer.Option(None, "--config", help="path to job.yaml on the NAS"),
-):
-    """Submit a training job."""
-    name, _, version = dataset.partition(":")
-    body = {
-        "job_type": "training",
-        "model_name": model,
-        "dataset_name": name,
-        "dataset_version": version or None,
-        "docker_image": image,
-        "tenant": tenant,
-        "config_path": config_path,
-    }
-    res = _request("POST", "/jobs", json=body)
-    console.print(f"[green]queued[/green] {res['job_id']}")
+# --------------------------------------------------------------------------- #
+# core helpers (shared by grouped commands and legacy aliases)
+# --------------------------------------------------------------------------- #
+JOB_COLS = [("job_id", "job_id"), ("type", "job_type"), ("model", "model_name"),
+            ("status", "status"), ("worker", "worker"), ("created", "created_at")]
 
 
-@app.command()
-def process(
-    model: str = typer.Option(..., help="model name"),
-    image: str = typer.Option(..., help="docker image for the processing job"),
-    tenant: str = typer.Option(None, help="tenant tag"),
-    config_path: str = typer.Option(None, "--config", help="path to job.yaml on the NAS"),
-):
-    """Submit a processing job."""
-    body = {
-        "job_type": "processing",
-        "model_name": model,
-        "docker_image": image,
-        "tenant": tenant,
-        "config_path": config_path,
-    }
-    res = _request("POST", "/jobs", json=body)
-    console.print(f"[green]queued[/green] {res['job_id']}")
+def _submit(ctx, body: dict):
+    g: G = ctx.obj
+    c = _client(ctx)
+    res = c.post("/jobs", json=body, spinner="submitting job…")
+    if g.output == "table":
+        output.success(f"queued {res['job_id']}")
+    else:
+        output.emit(res, g.output)
 
 
-@app.command()
-def status(job_id: str = typer.Option(..., "--job-id", help="job id")):
-    """Show one job."""
-    job = _request("GET", f"/jobs/{job_id}")
-    table = Table(show_header=False, box=None)
-    for key in (
-        "job_id", "job_type", "model_name", "dataset_version", "status",
-        "worker", "gpu", "requested_by", "created_at", "started_at",
-        "finished_at", "output_path", "error",
-    ):
-        val = job.get(key)
-        if val is not None:
-            table.add_row(f"[bold]{key}[/bold]", str(val))
-    console.print(table)
+def _job_train(ctx, model, dataset, image, tenant, config_path):
+    name, _, version = (dataset or "").partition(":")
+    _submit(ctx, {"job_type": "training", "model_name": model,
+                  "dataset_name": name or None, "dataset_version": version or None,
+                  "docker_image": image, "tenant": tenant, "config_path": config_path})
 
 
-@app.command(name="list-jobs")
-def list_jobs(
-    status: str = typer.Option(None, help="filter by status"),
-    model: str = typer.Option(None, help="filter by model"),
-    limit: int = typer.Option(20, help="max rows"),
-):
-    """List recent jobs."""
+def _job_process(ctx, model, image, dataset, tenant, config_path):
+    name, _, version = (dataset or "").partition(":") if dataset else ("", "", "")
+    _submit(ctx, {"job_type": "processing", "model_name": model,
+                  "dataset_name": name or None, "dataset_version": version or None,
+                  "docker_image": image, "tenant": tenant, "config_path": config_path})
+
+
+def _job_list(ctx, status, job_type, model, limit):
+    g: G = ctx.obj
     params = {"limit": limit}
-    if status:
-        params["status"] = status
-    if model:
-        params["model"] = model
-    jobs = _request("GET", "/jobs", params=params)
-
-    table = Table(title="jobs")
-    for col in ("job_id", "type", "model", "status", "worker", "created"):
-        table.add_column(col)
-    for j in jobs:
-        table.add_row(
-            j["job_id"], j["job_type"], j["model_name"], j["status"],
-            j.get("worker") or "-", (j.get("created_at") or "")[:19],
-        )
-    console.print(table)
+    for k, v in (("status", status), ("job_type", job_type), ("model", model)):
+        if v:
+            params[k] = v
+    jobs = _client(ctx).get("/jobs", params=params, spinner="loading jobs…")
+    output.emit(jobs, g.output, columns=JOB_COLS, title="jobs")
 
 
-@app.command()
-def models(model: str = typer.Option(None, help="model name; omit to list all models")):
-    """List models, or versions of one model (marking the active one)."""
-    if not model:
-        res = _request("GET", "/models")
-        table = Table(title="models")
-        table.add_column("model")
-        for m in res.get("models", []):
-            table.add_row(m)
-        console.print(table)
+def _job_show(ctx, job_id):
+    g: G = ctx.obj
+    output.emit(_client(ctx).get(f"/jobs/{job_id}"), g.output, title=job_id)
+
+
+def _job_cancel(ctx, job_id):
+    g: G = ctx.obj
+    res = _client(ctx).post(f"/jobs/{job_id}/cancel", spinner="cancelling…")
+    if g.output == "table":
+        note = f" ({res['note']})" if res.get("note") else ""
+        output.warn(f"{res['status']} {job_id}{note}")
+    else:
+        output.emit(res, g.output)
+
+
+# --------------------------------------------------------------------------- #
+# job group
+# --------------------------------------------------------------------------- #
+@job_app.command("train")
+def job_train(ctx: typer.Context,
+              model: str = typer.Option(..., help="model name"),
+              dataset: str = typer.Option(..., help="dataset as name:version"),
+              image: str = typer.Option(..., help="docker image"),
+              tenant: str = typer.Option(None), config: str = typer.Option(None, "--config")):
+    """Submit a training job."""
+    _job_train(ctx, model, dataset, image, tenant, config)
+
+
+@job_app.command("process")
+def job_process(ctx: typer.Context,
+                model: str = typer.Option(..., help="model name"),
+                image: str = typer.Option(..., help="docker image"),
+                dataset: str = typer.Option(None, help="images to process, name:version"),
+                tenant: str = typer.Option(None), config: str = typer.Option(None, "--config")):
+    """Submit a processing/inference job (serves the active model)."""
+    _job_process(ctx, model, image, dataset, tenant, config)
+
+
+@job_app.command("list")
+def job_list(ctx: typer.Context,
+             status: str = typer.Option(None), job_type: str = typer.Option(None, "--type"),
+             model: str = typer.Option(None), limit: int = typer.Option(20)):
+    """List recent jobs."""
+    _job_list(ctx, status, job_type, model, limit)
+
+
+@job_app.command("show")
+def job_show(ctx: typer.Context, job_id: str = typer.Argument(...)):
+    """Show one job."""
+    _job_show(ctx, job_id)
+
+
+@job_app.command("events")
+def job_events(ctx: typer.Context, job_id: str = typer.Argument(...)):
+    """Show a job's event timeline."""
+    g: G = ctx.obj
+    ev = _client(ctx).get(f"/jobs/{job_id}/events")
+    output.emit(ev, g.output, columns=[("time", "ts"), ("event", "event"), ("detail", "detail")],
+                title=f"{job_id} events")
+
+
+@job_app.command("watch")
+def job_watch(ctx: typer.Context, job_id: str = typer.Argument(...),
+              interval: float = typer.Option(2.0, help="poll interval (s)")):
+    """Poll a job until it finishes."""
+    g: G = ctx.obj
+    c = _client(ctx)
+    last = None
+    while True:
+        job = c.get(f"/jobs/{job_id}")
+        st = job["status"]
+        if st != last:
+            output.info(f"{job_id}: {output.badge(st)}")
+            last = st
+        if st in ("succeeded", "failed", "cancelled"):
+            if g.output != "table":
+                output.emit(job, g.output)
+            if st == "succeeded":
+                raise typer.Exit(0)
+            raise CLIError(f"job {st}: {job.get('error') or ''}".strip(), 1)
+        time.sleep(interval)
+
+
+@job_app.command("cancel")
+def job_cancel(ctx: typer.Context, job_id: str = typer.Argument(...)):
+    """Cancel a job (best-effort)."""
+    _job_cancel(ctx, job_id)
+
+
+# --------------------------------------------------------------------------- #
+# model group
+# --------------------------------------------------------------------------- #
+@model_app.command("list")
+def model_list(ctx: typer.Context):
+    """List models in the registry."""
+    g: G = ctx.obj
+    res = _client(ctx).get("/models")
+    output.emit([{"model": m} for m in res.get("models", [])], g.output, title="models")
+
+
+@model_app.command("show")
+def model_show(ctx: typer.Context, model: str = typer.Argument(...)):
+    """Show a model summary (active version + versions)."""
+    g: G = ctx.obj
+    m = _client(ctx).get(f"/models/{model}")
+    if g.output != "table":
+        output.emit(m, g.output)
         return
-
-    versions = _request("GET", f"/models/{model}/versions")
-    table = Table(title=f"{model} — versions")
-    for col in ("version", "status", "active"):
-        table.add_column(col)
-    for v in versions:
-        table.add_row(
-            v["version"],
-            v.get("status") or "-",
-            "★ active" if v.get("active") else "",
-        )
-    console.print(table)
+    output.info(f"[bold]{model}[/]  active: {output.badge('validated') if m['active_version'] else '-'} "
+                f"{m['active_version'] or '(none)'}")
+    output.emit(m["versions"], g.output,
+                columns=[("version", "version"), ("status", "status"), ("active", "active")],
+                title=f"{model} versions")
 
 
-@app.command()
-def promote(
-    model: str = typer.Option(..., help="model name"),
-    version: str = typer.Option(..., help="version to promote (must be validated)"),
-    reason: str = typer.Option(None, help="why (recorded in the audit log)"),
-):
+@model_app.command("versions")
+def model_versions(ctx: typer.Context, model: str = typer.Argument(...)):
+    """List a model's versions."""
+    g: G = ctx.obj
+    vs = _client(ctx).get(f"/models/{model}/versions")
+    output.emit(vs, g.output, columns=[("version", "version"), ("status", "status"),
+                                        ("active", "active")], title=f"{model} versions")
+
+
+@model_app.command("compare")
+def model_compare(ctx: typer.Context, model: str = typer.Argument(...),
+                  version_a: str = typer.Argument(...), version_b: str = typer.Argument(...)):
+    """Compare metrics of two versions."""
+    g: G = ctx.obj
+    c = _client(ctx)
+    a = c.get(f"/models/{model}/versions/{version_a}")["metadata"].get("metrics", {})
+    b = c.get(f"/models/{model}/versions/{version_b}")["metadata"].get("metrics", {})
+    rows = []
+    for k in sorted(set(a) | set(b)):
+        av, bv = a.get(k), b.get(k)
+        delta = round(bv - av, 4) if isinstance(av, (int, float)) and isinstance(bv, (int, float)) else "-"
+        rows.append({"metric": k, version_a: av, version_b: bv, "delta": delta})
+    output.emit(rows, g.output,
+                columns=[("metric", "metric"), (version_a, version_a), (version_b, version_b), ("Δ", "delta")],
+                title=f"{model}: {version_a} vs {version_b}")
+
+
+@model_app.command("promote")
+def model_promote(ctx: typer.Context, model: str = typer.Argument(...),
+                  version: str = typer.Argument(...), reason: str = typer.Option(None)):
     """Promote a validated version to production."""
-    res = _request("POST", f"/models/{model}/promote",
-                   json={"version": version, "reason": reason})
-    console.print(f"[green]promoted[/green] {model} -> {res['active_version']}"
-                  f" (was {res.get('previous_stable') or 'none'})")
+    g: G = ctx.obj
+    res = _client(ctx).post(f"/models/{model}/promote", json={"version": version, "reason": reason},
+                            spinner="promoting…")
+    if g.output == "table":
+        output.success(f"promoted {model} -> {res['active_version']} (was {res.get('previous_stable') or 'none'})")
+    else:
+        output.emit(res, g.output)
 
 
-@app.command()
-def rollback(
-    model: str = typer.Option(..., help="model name"),
-    to: str = typer.Option(None, "--to", help="version to roll back to (default: previous stable)"),
-    reason: str = typer.Option(None, help="why (recorded in the audit log)"),
-):
-    """Roll production back to the previous stable version (or an explicit one)."""
-    res = _request("POST", f"/models/{model}/rollback",
-                   json={"to": to, "reason": reason})
-    console.print(f"[yellow]rolled back[/yellow] {model} -> {res['active_version']}")
+@model_app.command("rollback")
+def model_rollback(ctx: typer.Context, model: str = typer.Argument(...),
+                   to: str = typer.Option(None, "--to"), reason: str = typer.Option(None)):
+    """Roll production back to the previous (or a given) version."""
+    g: G = ctx.obj
+    res = _client(ctx).post(f"/models/{model}/rollback", json={"to": to, "reason": reason},
+                            spinner="rolling back…")
+    if g.output == "table":
+        output.warn(f"rolled back {model} -> {res['active_version']}")
+    else:
+        output.emit(res, g.output)
 
 
-@app.command()
-def cancel(job_id: str = typer.Option(..., "--job-id", help="job to cancel")):
-    """Cancel a job (best-effort: kills the running container, marks cancelled)."""
-    res = _request("POST", f"/jobs/{job_id}/cancel")
-    note = f" ({res['note']})" if res.get("note") else ""
-    console.print(f"[yellow]{res['status']}[/yellow] {job_id}{note}")
+# --------------------------------------------------------------------------- #
+# worker / gpu / system groups
+# --------------------------------------------------------------------------- #
+@worker_app.command("list")
+def worker_list(ctx: typer.Context):
+    """List GPU workers and their heartbeat."""
+    g: G = ctx.obj
+    output.emit(_client(ctx).get("/workers"), g.output,
+                columns=[("worker", "name"), ("online", "online"),
+                         ("since hb (s)", "seconds_since_heartbeat"), ("job", "current_job")],
+                title="workers")
 
 
-def main() -> None:
-    app()
+@gpu_app.command("list")
+def gpu_list(ctx: typer.Context):
+    """List GPUs (utilisation, memory, temperature)."""
+    g: G = ctx.obj
+    output.emit(_client(ctx).get("/gpus"), g.output,
+                columns=[("idx", "index"), ("name", "name"), ("used MB", "memory_used_mb"),
+                         ("total MB", "memory_total_mb"), ("util %", "utilization_pct"),
+                         ("temp °C", "temperature_c")], title="gpus")
+
+
+@system_app.command("version")
+def system_version(ctx: typer.Context):
+    """Show the API version."""
+    g: G = ctx.obj
+    output.emit(_client(ctx).get("/version"), g.output)
+
+
+@system_app.command("health")
+def system_health(ctx: typer.Context):
+    """Show platform readiness (db, queue, NAS)."""
+    g: G = ctx.obj
+    output.emit(_client(ctx).get("/health/ready"), g.output)
+
+
+@system_app.command("doctor")
+def system_doctor(ctx: typer.Context):
+    """Diagnose connectivity and auth from THIS machine."""
+    g: G = ctx.obj
+    ok = True
+
+    def check(label, passed, detail=""):
+        nonlocal ok
+        mark = "[green]✓[/]" if passed else "[red]✗[/]"
+        output.err.print(f"{mark} {label}" + (f" [dim]{detail}[/]" if detail else ""))
+        ok = ok and passed
+
+    # config
+    try:
+        url, tok, name = config.resolve(g.profile, g.api_url, g.token)
+        check("config resolves", True, f"profile={name}")
+    except config.ConfigError as exc:
+        check("config resolves", False, str(exc))
+        raise CLIError("fix your config with `vgreens-ai config init`", 1)
+
+    parsed = urlparse(url)
+    check("URL format", bool(parsed.scheme and parsed.netloc), url)
+
+    host = parsed.hostname or ""
+    try:
+        socket.gethostbyname(host)
+        check("DNS resolves", True, host)
+    except Exception as exc:  # noqa: BLE001
+        check("DNS resolves", False, f"{host}: {exc}")
+
+    c = Client(url, tok, timeout=g.timeout, quiet=True)
+    try:
+        live = c.get("/health/live")
+        check("API reachable", live.get("status") == "alive")
+    except CLIError as exc:
+        check("API reachable", False, str(exc))
+        raise CLIError("API not reachable — check URL / VPN", exc.code)
+
+    try:
+        ver = c.get("/version")
+        check("API version", True, f"{ver.get('version')} ({ver.get('commit')})")
+    except CLIError as exc:
+        check("API version", False, str(exc))
+
+    try:
+        c.get("/jobs", params={"limit": 1})
+        check("authentication", True)
+    except CLIError as exc:
+        check("authentication", False, str(exc))
+
+    if not ok:
+        raise CLIError("some checks failed (see above)", 1)
+    output.success("all checks passed")
+
+
+# --------------------------------------------------------------------------- #
+# config group
+# --------------------------------------------------------------------------- #
+@config_app.command("init")
+def config_init(profile: str = typer.Option("prod", help="profile name"),
+                api_url: str = typer.Option(None, help="skip the prompt with this URL"),
+                token: str = typer.Option(None, help="skip the prompt with this token")):
+    """Guided setup: prompt, validate reachability + auth, save securely."""
+    url = api_url or typer.prompt("Platform API URL (e.g. https://ai.internal/api)")
+    url = url.rstrip("/")
+    # validate reachability before asking for a secret
+    probe = Client(url, "probe", timeout=10, quiet=True)
+    try:
+        probe.get("/health/live")
+        output.success(f"reachable: {url}")
+    except CLIError as exc:
+        output.warn(f"could not reach {url}: {exc}")
+        if not typer.confirm("Save anyway?", default=False):
+            raise typer.Exit(1)
+    tok = token or typer.prompt("API token", hide_input=True)
+    # test auth
+    try:
+        Client(url, tok, timeout=10, quiet=True).get("/jobs", params={"limit": 1})
+        output.success("authentication OK")
+    except CLIError as exc:
+        output.error(f"auth check failed: {exc}")
+        if not typer.confirm("Save anyway?", default=False):
+            raise typer.Exit(1)
+    config.save_profile(profile, url, tok, make_default=True)
+    output.success(f"saved profile '{profile}' to {config.CONFIG_PATH} (chmod 600). "
+                   f"Token stored: {config.redact(tok)}")
+
+
+@config_app.command("show")
+def config_show():
+    """Show configured profiles (tokens redacted)."""
+    profs = config.profiles()
+    if not profs:
+        data = config.raw()
+        if data.get("api_url"):
+            profs = {"default (legacy)": {"api_url": data.get("api_url"), "token": data.get("token", "")}}
+    rows = [{"profile": (n + (" *" if n == config.default_profile() else "")),
+             "api_url": p.get("api_url"), "token": config.redact(p.get("token", ""))}
+            for n, p in profs.items()]
+    output.emit(rows or [], "table",
+                columns=[("profile", "profile"), ("api_url", "api_url"), ("token", "token")],
+                title="profiles (* = default)")
+
+
+@config_app.command("profiles")
+def config_profiles():
+    """List profile names."""
+    for n in config.profiles():
+        marker = " *" if n == config.default_profile() else ""
+        output.err.print(f"{n}{marker}")
+
+
+@config_app.command("use")
+def config_use(profile: str = typer.Argument(...)):
+    """Set the default profile."""
+    try:
+        config.set_default(profile)
+    except config.ConfigError as exc:
+        raise CLIError(str(exc), 1)
+    output.success(f"default profile is now '{profile}'")
+
+
+# --------------------------------------------------------------------------- #
+# dataset group (forward-compatible: works once the server exposes /datasets)
+# --------------------------------------------------------------------------- #
+@dataset_app.command("list")
+def dataset_list(ctx: typer.Context):
+    """List datasets (requires server support)."""
+    g: G = ctx.obj
+    try:
+        output.emit(_client(ctx).get("/datasets"), g.output, title="datasets")
+    except CLIError as exc:
+        if exc.code == 5:
+            raise CLIError("the datasets API isn't available on this server yet", 5)
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# backward-compatible top-level aliases
+# --------------------------------------------------------------------------- #
+@app.command("train", hidden=True)
+def _train(ctx: typer.Context, model: str = typer.Option(...), dataset: str = typer.Option(...),
+           image: str = typer.Option("vgreens/dummy-job:v1"), tenant: str = typer.Option(None),
+           config: str = typer.Option(None, "--config")):
+    _job_train(ctx, model, dataset, image, tenant, config)
+
+
+@app.command("process", hidden=True)
+def _process(ctx: typer.Context, model: str = typer.Option(...), image: str = typer.Option(...),
+             dataset: str = typer.Option(None), tenant: str = typer.Option(None),
+             config: str = typer.Option(None, "--config")):
+    _job_process(ctx, model, image, dataset, tenant, config)
+
+
+@app.command("status", hidden=True)
+def _status(ctx: typer.Context, job_id: str = typer.Option(..., "--job-id")):
+    _job_show(ctx, job_id)
+
+
+@app.command("list-jobs", hidden=True)
+def _list_jobs(ctx: typer.Context, status: str = typer.Option(None), model: str = typer.Option(None),
+               limit: int = typer.Option(20)):
+    _job_list(ctx, status, None, model, limit)
+
+
+@app.command("cancel", hidden=True)
+def _cancel(ctx: typer.Context, job_id: str = typer.Option(..., "--job-id")):
+    _job_cancel(ctx, job_id)
+
+
+@app.command("models", hidden=True)
+def _models(ctx: typer.Context, model: str = typer.Option(None)):
+    if model:
+        model_show(ctx, model)
+    else:
+        model_list(ctx)
+
+
+@app.command("promote", hidden=True)
+def _promote(ctx: typer.Context, model: str = typer.Option(...), version: str = typer.Option(...),
+             reason: str = typer.Option(None)):
+    model_promote(ctx, model, version, reason)
+
+
+@app.command("rollback", hidden=True)
+def _rollback(ctx: typer.Context, model: str = typer.Option(...), to: str = typer.Option(None, "--to"),
+              reason: str = typer.Option(None)):
+    model_rollback(ctx, model, to, reason)
+
+
+def run() -> None:
+    """Entry point: wrap the Typer app so CLIError prints cleanly with an exit code."""
+    try:
+        app()
+    except CLIError as exc:
+        output.error(str(exc))
+        raise SystemExit(exc.code)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run()
