@@ -1,0 +1,17 @@
+# Training config for the strawberry_disease model.
+# Provide this file to a job via its config_path (a copy on the NAS), so the
+# platform mounts it at /config/job.yaml.
+
+train:
+  model: /app/yolo11n.pt   # baked-in Ultralytics backbone (yolo11n)
+  epochs: 50               # a first smoke-test run can set this to 3–5
+  imgsz: 640
+  batch: 16                # int, or -1 for Ultralytics auto-batch
+  patience: 20             # early-stop if val mAP plateaus
+
+# The platform compares the model's achieved metrics (from /out/eval/metrics.json)
+# against these to mark the registry version validated or rejected.
+# Metric-agnostic: every key here must also appear in metrics.json.
+thresholds:                # achieved must be >= these
+  mAP50: 0.50
+thresholds_max: {}         # achieved must be <= these (e.g. a loss ceiling)
