@@ -78,6 +78,16 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
 
 
+def ping() -> bool:
+    """Cheap connectivity check for readiness probes."""
+    try:
+        with _connect() as conn:
+            conn.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
 def insert_job(job: dict) -> None:
     cols = (
         "job_id", "job_type", "model_name", "dataset_name", "dataset_version",

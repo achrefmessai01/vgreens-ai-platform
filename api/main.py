@@ -32,7 +32,26 @@ from auth import require_token
 NAS_JOBS_ROOT = os.environ.get("NAS_JOBS_ROOT", "/mnt/vgreens_storage/ai/jobs")
 NAS_MOUNTPOINT = os.environ.get("NAS_MOUNTPOINT", "/mnt/vgreens_storage")
 
-app = FastAPI(title="vGreens Job API", version="0.1.0")
+VERSION = "0.2.0"        # API version (bumped for Phase 3 additive endpoints)
+API_LEVEL = "v1"         # wire-compat level; bump only on breaking changes
+
+
+def _git_commit() -> str:
+    """Short commit of the deployed code (read-only; 'unknown' if unavailable)."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(__file__) or ".",
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+COMMIT = _git_commit()
+
+app = FastAPI(title="vGreens Job API", version=VERSION)
 
 
 @app.on_event("startup")
@@ -282,6 +301,35 @@ def metrics() -> Response:
         except (TypeError, ValueError):
             pass
     return Response(generate_latest(reg), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/version")
+def version() -> dict:
+    return {"name": "vGreens Job API", "version": VERSION, "api": API_LEVEL, "commit": COMMIT}
+
+
+@app.get("/health/live")
+def health_live() -> dict:
+    """Liveness: is the process up? Deliberately cheap — no dependency checks, so a
+    NAS/broker blip can't trigger a restart loop."""
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+def health_ready(response: Response) -> dict:
+    """Readiness: can we safely serve requests? Requires the DB and the broker.
+    NAS is reported but does NOT gate readiness (a NAS blip shouldn't take the API out)."""
+    db_ok = db.ping()
+    queue_ok = jobqueue.check_connection()
+    ready = db_ok and queue_ok
+    if not ready:
+        response.status_code = 503
+    return {
+        "status": "ready" if ready else "not_ready",
+        "db": "ok" if db_ok else "down",
+        "queue": "connected" if queue_ok else "unreachable",
+        "nas": "mounted" if os.path.ismount(NAS_MOUNTPOINT) else "missing",
+    }
 
 
 @app.get("/health")
