@@ -85,6 +85,18 @@ def _client(ctx: typer.Context) -> Client:
     return Client(url, tok, timeout=g.timeout, quiet=g.quiet)
 
 
+# Per-command --output/-o override so `job list -o json` works (in addition to the
+# global `-o` before the subcommand). Mutates the shared state read by the helpers.
+OUTPUT_OPT = typer.Option(None, "-o", "--output", help="table | json | yaml (overrides global)")
+
+
+def _mode(ctx: typer.Context, out: Optional[str]) -> None:
+    if out:
+        if out not in ("table", "json", "yaml"):
+            raise CLIError("--output must be one of: table, json, yaml", 2)
+        ctx.obj.output = out
+
+
 # --------------------------------------------------------------------------- #
 # core helpers (shared by grouped commands and legacy aliases)
 # --------------------------------------------------------------------------- #
@@ -167,20 +179,24 @@ def job_process(ctx: typer.Context,
 @job_app.command("list")
 def job_list(ctx: typer.Context,
              status: str = typer.Option(None), job_type: str = typer.Option(None, "--type"),
-             model: str = typer.Option(None), limit: int = typer.Option(20)):
+             model: str = typer.Option(None), limit: int = typer.Option(20),
+             out: Optional[str] = OUTPUT_OPT):
     """List recent jobs."""
+    _mode(ctx, out)
     _job_list(ctx, status, job_type, model, limit)
 
 
 @job_app.command("show")
-def job_show(ctx: typer.Context, job_id: str = typer.Argument(...)):
+def job_show(ctx: typer.Context, job_id: str = typer.Argument(...), out: Optional[str] = OUTPUT_OPT):
     """Show one job."""
+    _mode(ctx, out)
     _job_show(ctx, job_id)
 
 
 @job_app.command("events")
-def job_events(ctx: typer.Context, job_id: str = typer.Argument(...)):
+def job_events(ctx: typer.Context, job_id: str = typer.Argument(...), out: Optional[str] = OUTPUT_OPT):
     """Show a job's event timeline."""
+    _mode(ctx, out)
     g: G = ctx.obj
     ev = _client(ctx).get(f"/jobs/{job_id}/events")
     output.emit(ev, g.output, columns=[("time", "ts"), ("event", "event"), ("detail", "detail")],
@@ -219,16 +235,18 @@ def job_cancel(ctx: typer.Context, job_id: str = typer.Argument(...)):
 # model group
 # --------------------------------------------------------------------------- #
 @model_app.command("list")
-def model_list(ctx: typer.Context):
+def model_list(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
     """List models in the registry."""
+    _mode(ctx, out)
     g: G = ctx.obj
     res = _client(ctx).get("/models")
     output.emit([{"model": m} for m in res.get("models", [])], g.output, title="models")
 
 
 @model_app.command("show")
-def model_show(ctx: typer.Context, model: str = typer.Argument(...)):
+def model_show(ctx: typer.Context, model: str = typer.Argument(...), out: Optional[str] = OUTPUT_OPT):
     """Show a model summary (active version + versions)."""
+    _mode(ctx, out)
     g: G = ctx.obj
     m = _client(ctx).get(f"/models/{model}")
     if g.output != "table":
@@ -242,8 +260,9 @@ def model_show(ctx: typer.Context, model: str = typer.Argument(...)):
 
 
 @model_app.command("versions")
-def model_versions(ctx: typer.Context, model: str = typer.Argument(...)):
+def model_versions(ctx: typer.Context, model: str = typer.Argument(...), out: Optional[str] = OUTPUT_OPT):
     """List a model's versions."""
+    _mode(ctx, out)
     g: G = ctx.obj
     vs = _client(ctx).get(f"/models/{model}/versions")
     output.emit(vs, g.output, columns=[("version", "version"), ("status", "status"),
@@ -252,8 +271,10 @@ def model_versions(ctx: typer.Context, model: str = typer.Argument(...)):
 
 @model_app.command("compare")
 def model_compare(ctx: typer.Context, model: str = typer.Argument(...),
-                  version_a: str = typer.Argument(...), version_b: str = typer.Argument(...)):
+                  version_a: str = typer.Argument(...), version_b: str = typer.Argument(...),
+                  out: Optional[str] = OUTPUT_OPT):
     """Compare metrics of two versions."""
+    _mode(ctx, out)
     g: G = ctx.obj
     c = _client(ctx)
     a = c.get(f"/models/{model}/versions/{version_a}")["metadata"].get("metrics", {})
@@ -298,8 +319,9 @@ def model_rollback(ctx: typer.Context, model: str = typer.Argument(...),
 # worker / gpu / system groups
 # --------------------------------------------------------------------------- #
 @worker_app.command("list")
-def worker_list(ctx: typer.Context):
+def worker_list(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
     """List GPU workers and their heartbeat."""
+    _mode(ctx, out)
     g: G = ctx.obj
     output.emit(_client(ctx).get("/workers"), g.output,
                 columns=[("worker", "name"), ("online", "online"),
@@ -308,8 +330,9 @@ def worker_list(ctx: typer.Context):
 
 
 @gpu_app.command("list")
-def gpu_list(ctx: typer.Context):
+def gpu_list(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
     """List GPUs (utilisation, memory, temperature)."""
+    _mode(ctx, out)
     g: G = ctx.obj
     output.emit(_client(ctx).get("/gpus"), g.output,
                 columns=[("idx", "index"), ("name", "name"), ("used MB", "memory_used_mb"),
@@ -318,15 +341,17 @@ def gpu_list(ctx: typer.Context):
 
 
 @system_app.command("version")
-def system_version(ctx: typer.Context):
+def system_version(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
     """Show the API version."""
+    _mode(ctx, out)
     g: G = ctx.obj
     output.emit(_client(ctx).get("/version"), g.output)
 
 
 @system_app.command("health")
-def system_health(ctx: typer.Context):
+def system_health(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
     """Show platform readiness (db, queue, NAS)."""
+    _mode(ctx, out)
     g: G = ctx.obj
     output.emit(_client(ctx).get("/health/ready"), g.output)
 
