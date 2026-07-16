@@ -73,9 +73,56 @@ def _connect():
         conn.close()
 
 
+# Ordered, idempotent migrations applied after the base SCHEMA. Each runs once and
+# is recorded in schema_migrations. Add new ones with the next integer version;
+# never edit an already-shipped migration.
+MIGRATIONS: list[tuple[int, str, str]] = [
+    (1, "job_events + audit_events", """
+        CREATE TABLE IF NOT EXISTS job_events (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id  TEXT NOT NULL,
+            ts      TEXT NOT NULL,
+            event   TEXT NOT NULL,
+            detail  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id);
+
+        CREATE TABLE IF NOT EXISTS audit_events (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts      TEXT NOT NULL,
+            actor   TEXT,
+            action  TEXT NOT NULL,
+            target  TEXT,
+            result  TEXT,
+            reason  TEXT,
+            source  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
+    """),
+]
+
+
+def _apply_migrations(conn) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations "
+        "(version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT)"
+    )
+    applied = {r[0] for r in conn.execute("SELECT version FROM schema_migrations")}
+    for version, name, sql in MIGRATIONS:
+        if version in applied:
+            continue
+        conn.executescript(sql)
+        conn.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)",
+            (version, name, now_iso()),
+        )
+        print(f"[db] applied migration {version}: {name}", flush=True)
+
+
 def init_db() -> None:
     with _connect() as conn:
-        conn.executescript(SCHEMA)
+        conn.executescript(SCHEMA)      # base tables (create-if-not-exists)
+        _apply_migrations(conn)         # ordered, tracked schema changes
 
 
 def ping() -> bool:
@@ -100,6 +147,10 @@ def insert_job(job: dict) -> None:
     with _connect() as conn:
         conn.execute(
             f"INSERT INTO jobs ({','.join(cols)}) VALUES ({placeholders})", values
+        )
+        conn.execute(
+            "INSERT INTO job_events(job_id, ts, event, detail) VALUES(?,?,?,?)",
+            (job["job_id"], now_iso(), "queued", None),
         )
 
 
@@ -135,7 +186,8 @@ def update_status(job_id: str, status: str, **fields) -> bool:
     """
     with _connect() as conn:
         row = conn.execute("SELECT status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-        if row is not None and row["status"] == "cancelled" and status != "cancelled":
+        prev_status = row["status"] if row is not None else None
+        if prev_status == "cancelled" and status != "cancelled":
             return False
 
     sets = {"status": status}
@@ -151,6 +203,12 @@ def update_status(job_id: str, status: str, **fields) -> bool:
     params = list(sets.values()) + [job_id]
     with _connect() as conn:
         cur = conn.execute(f"UPDATE jobs SET {assignments} WHERE job_id = ?", params)
+        if cur.rowcount > 0 and status != prev_status:   # only log real transitions
+            detail = fields.get("error") or fields.get("result_version")
+            conn.execute(
+                "INSERT INTO job_events(job_id, ts, event, detail) VALUES(?,?,?,?)",
+                (job_id, now_iso(), status, detail),
+            )
         return cur.rowcount > 0
 
 
@@ -241,4 +299,44 @@ def heartbeat(name: str) -> None:
 def list_workers() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute("SELECT name, last_seen FROM workers").fetchall()
+        return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# job event timeline + audit trail (append-only)
+# --------------------------------------------------------------------------- #
+def add_job_event(job_id: str, event: str, detail: str | None = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO job_events(job_id, ts, event, detail) VALUES(?,?,?,?)",
+            (job_id, now_iso(), event, detail),
+        )
+
+
+def list_job_events(job_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT ts, event, detail FROM job_events WHERE job_id = ? ORDER BY id",
+            (job_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def add_audit(actor: str, action: str, target: str | None = None,
+              result: str = "ok", reason: str | None = None, source: str = "api") -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO audit_events(ts, actor, action, target, result, reason, source) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (now_iso(), actor, action, target, result, reason, source),
+        )
+
+
+def list_audit(limit: int = 50) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT ts, actor, action, target, result, reason, source "
+            "FROM audit_events ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
         return [dict(r) for r in rows]

@@ -166,6 +166,7 @@ def create_job(req: JobRequest, requested_by: str = Depends(require_token)) -> d
         db.update_status(job_id, "failed", error=f"publish failed: {exc}")
         raise HTTPException(status_code=503, detail=f"queue unavailable: {exc}")
 
+    db.add_audit(requested_by, "job.submit", job_id, source="api")
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -175,6 +176,13 @@ def read_job(job_id: str, _: str = Depends(require_token)) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+@app.get("/jobs/{job_id}/events")
+def read_job_events(job_id: str, _: str = Depends(require_token)) -> list[dict]:
+    if db.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return db.list_job_events(job_id)
 
 
 @app.get("/jobs")
@@ -197,6 +205,7 @@ def cancel_job(job_id: str, who: str = Depends(require_token)) -> dict:
         return {"job_id": job_id, "status": job["status"], "note": "already finished"}
 
     db.update_status(job_id, "cancelled", error=f"cancelled by {who}")
+    db.add_audit(who, "job.cancel", job_id, source="api")
     # kill the container if it's running (named vgreens-job-<id>); ignore if absent
     try:
         subprocess.run(["docker", "kill", f"vgreens-job-{job_id}"],
@@ -267,17 +276,27 @@ def active_model(model: str, _: str = Depends(require_token)) -> dict:
 @app.post("/models/{model}/promote")
 def promote_model(model: str, body: PromoteBody, who: str = Depends(require_token)) -> dict:
     try:
-        return reg.promote(model, body.version, who, body.reason)
+        res = reg.promote(model, body.version, who, body.reason)
     except reg.RegistryError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    db.add_audit(who, "model.promote", f"{model}:{body.version}", reason=body.reason, source="api")
+    return res
 
 
 @app.post("/models/{model}/rollback")
 def rollback_model(model: str, body: RollbackBody, who: str = Depends(require_token)) -> dict:
     try:
-        return reg.rollback(model, body.to, who, body.reason)
+        res = reg.rollback(model, body.to, who, body.reason)
     except reg.RegistryError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    db.add_audit(who, "model.rollback", f"{model}:{res.get('active_version')}",
+                 reason=body.reason, source="api")
+    return res
+
+
+@app.get("/audit")
+def read_audit(limit: int = 50, _: str = Depends(require_token)) -> list[dict]:
+    return db.list_audit(limit=limit)
 
 
 @app.get("/metrics")
