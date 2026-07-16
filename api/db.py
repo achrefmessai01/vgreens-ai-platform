@@ -160,21 +160,32 @@ def get_job(job_id: str) -> dict | None:
         return dict(row) if row else None
 
 
-def list_jobs(status: str | None = None, model: str | None = None, limit: int = 50) -> list[dict]:
+def _job_filters(status=None, model=None, job_type=None, tenant=None, worker=None):
     clauses, params = [], []
-    if status:
-        clauses.append("status = ?")
-        params.append(status)
-    if model:
-        clauses.append("model_name = ?")
-        params.append(model)
+    for col, val in (("status", status), ("model_name", model), ("job_type", job_type),
+                     ("tenant", tenant), ("worker", worker)):
+        if val:
+            clauses.append(f"{col} = ?")
+            params.append(val)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    params.append(int(limit))
+    return where, params
+
+
+def list_jobs(status=None, model=None, job_type=None, tenant=None, worker=None,
+              limit: int = 50, offset: int = 0) -> list[dict]:
+    where, params = _job_filters(status, model, job_type, tenant, worker)
     with _connect() as conn:
         rows = conn.execute(
-            f"SELECT * FROM jobs {where} ORDER BY created_at DESC LIMIT ?", params
+            f"SELECT * FROM jobs {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            params + [int(limit), int(offset)],
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def count_jobs(status=None, model=None, job_type=None, tenant=None, worker=None) -> int:
+    where, params = _job_filters(status, model, job_type, tenant, worker)
+    with _connect() as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM jobs {where}", params).fetchone()[0]
 
 
 def update_status(job_id: str, status: str, **fields) -> bool:

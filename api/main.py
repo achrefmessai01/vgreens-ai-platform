@@ -187,12 +187,22 @@ def read_job_events(job_id: str, _: str = Depends(require_token)) -> list[dict]:
 
 @app.get("/jobs")
 def read_jobs(
+    response: Response,
     status: Optional[str] = None,
     model: Optional[str] = None,
+    job_type: Optional[str] = None,
+    tenant: Optional[str] = None,
+    worker: Optional[str] = None,
     limit: int = 50,
+    offset: int = 0,
     _: str = Depends(require_token),
 ) -> list[dict]:
-    return db.list_jobs(status=status, model=model, limit=limit)
+    # body stays a plain list (backward-compatible with the CLI); total for the
+    # web UI's pagination goes in a header.
+    response.headers["X-Total-Count"] = str(
+        db.count_jobs(status, model, job_type, tenant, worker)
+    )
+    return db.list_jobs(status, model, job_type, tenant, worker, limit, offset)
 
 
 @app.post("/jobs/{job_id}/cancel")
@@ -263,9 +273,24 @@ def list_models(_: str = Depends(require_token)) -> dict:
     return {"models": reg.list_models()}
 
 
+@app.get("/models/{model}")
+def read_model(model: str, _: str = Depends(require_token)) -> dict:
+    if model not in reg.list_models():
+        raise HTTPException(status_code=404, detail="model not found")
+    return reg.get_model_summary(model)
+
+
 @app.get("/models/{model}/versions")
 def list_versions(model: str, _: str = Depends(require_token)) -> list[dict]:
     return reg.list_versions(model)
+
+
+@app.get("/models/{model}/versions/{version}")
+def read_model_version(model: str, version: str, _: str = Depends(require_token)) -> dict:
+    v = reg.get_version(model, version)
+    if v is None:
+        raise HTTPException(status_code=404, detail="version not found")
+    return v
 
 
 @app.get("/models/{model}/active")
@@ -320,6 +345,53 @@ def metrics() -> Response:
         except (TypeError, ValueError):
             pass
     return Response(generate_latest(reg), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/workers")
+def read_workers(_: str = Depends(require_token)) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    out = []
+    for w in db.list_workers():
+        age = None
+        try:
+            age = (now - datetime.fromisoformat(w["last_seen"])).total_seconds()
+        except (TypeError, ValueError):
+            pass
+        running = db.list_jobs(worker=w["name"], status="running", limit=1)
+        out.append({
+            "name": w["name"],
+            "last_seen": w["last_seen"],
+            "seconds_since_heartbeat": round(age, 1) if age is not None else None,
+            "online": age is not None and age < 90,
+            "current_job": running[0]["job_id"] if running else None,
+        })
+    return out
+
+
+def _query_gpus() -> list[dict]:
+    """Read GPU state from nvidia-smi on the host (read-only)."""
+    fields = "index,name,memory.used,memory.total,utilization.gpu,temperature.gpu"
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        gpus = []
+        for line in out.stdout.strip().splitlines():
+            idx, name, mu, mt, util, temp = [x.strip() for x in line.split(",")]
+            gpus.append({
+                "index": int(idx), "name": name,
+                "memory_used_mb": int(mu), "memory_total_mb": int(mt),
+                "utilization_pct": int(util), "temperature_c": int(temp),
+            })
+        return gpus
+    except Exception:
+        return []
+
+
+@app.get("/gpus")
+def read_gpus(_: str = Depends(require_token)) -> list[dict]:
+    return _query_gpus()
 
 
 @app.get("/version")

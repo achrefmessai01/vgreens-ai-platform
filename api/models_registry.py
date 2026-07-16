@@ -84,6 +84,29 @@ def list_versions(model: str) -> list[dict]:
     return out
 
 
+def get_version(model: str, version: str) -> dict | None:
+    vdir = _versions_dir(model) / version
+    if not vdir.is_dir():
+        return None
+    return {
+        "model": model,
+        "version": version,
+        "status": _read_json(vdir / "status.json"),
+        "metadata": _read_json(vdir / "metadata.json"),
+    }
+
+
+def get_model_summary(model: str) -> dict:
+    active = get_active(model)
+    return {
+        "model": model,
+        "active_version": (active or {}).get("active_version"),
+        "active_pointer": active,
+        "version_count": len(list_versions(model)),
+        "versions": list_versions(model),
+    }
+
+
 def _write_atomic(path: Path, data: dict) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))
