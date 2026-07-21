@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import bcrypt
-from fastapi import Cookie, Header
+from fastapi import Cookie, Depends, Header, HTTPException
 
 import auth as static_auth
 import db
@@ -115,6 +115,21 @@ def resolve_identity(authorization: str = "", session: str = "") -> Optional[Ide
 
 def role_at_least(role: str, minimum: str) -> bool:
     return _ROLE_RANK.get(role, -1) >= _ROLE_RANK.get(minimum, 99)
+
+
+def actor(minimum: str = "viewer"):
+    """FastAPI dependency factory. Resolves the caller (session cookie / API
+    token / static token), enforces a minimum role, and returns the username
+    string (so existing handlers that used the caller name keep working)."""
+    def dep(authorization: str = Header(default=""),
+            vg_session: str = Cookie(default="")) -> str:
+        ident = resolve_identity(authorization, vg_session)
+        if ident is None:
+            raise HTTPException(status_code=401, detail="authentication required")
+        if not role_at_least(ident.role, minimum):
+            raise HTTPException(status_code=403, detail=f"requires '{minimum}' role or higher")
+        return ident.username
+    return dep
 
 
 # ---- FastAPI dependency ----

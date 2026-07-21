@@ -50,6 +50,38 @@ def test_existing_route_bearer_still_works():
     assert r.status_code == 200
 
 
+def _mkuser(username, role, pw="secret123"):
+    if db.get_user_by_username(username) is None:
+        db.create_user(username, authn.hash_password(pw), role=role)
+
+
+def test_rbac_viewer_can_read_not_write():
+    _mkuser("vv", "viewer")
+    client.cookies.clear()
+    client.post("/auth/login", json={"username": "vv", "password": "secret123"})
+    assert client.get("/jobs", params={"limit": 1}).status_code == 200          # read ok
+    r = client.post("/jobs", json={"job_type": "training", "model_name": "m", "docker_image": "i"})
+    assert r.status_code == 403                                                  # cannot submit
+    client.cookies.clear()
+
+
+def test_rbac_operator_submits_but_not_promote():
+    _mkuser("oo", "operator")
+    client.cookies.clear()
+    client.post("/auth/login", json={"username": "oo", "password": "secret123"})
+    r = client.post("/jobs", json={"job_type": "training", "model_name": "m", "docker_image": "i"})
+    assert r.status_code not in (401, 403)          # auth passed (503 if no broker/NAS is fine)
+    assert client.post("/models/m/promote", json={"version": "v1"}).status_code == 403
+    client.cookies.clear()
+
+
+def test_rbac_static_token_is_admin():
+    client.cookies.clear()
+    r = client.post("/models/nope/promote", json={"version": "v1"},
+                    headers={"Authorization": "Bearer statictok"})
+    assert r.status_code not in (401, 403)          # admin-equivalent; fails later (404/409), not on auth
+
+
 def test_change_password_roundtrip():
     client.cookies.clear()
     client.post("/auth/login", json={"username": "admin", "password": "adminpass1"})

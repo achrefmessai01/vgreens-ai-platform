@@ -134,7 +134,7 @@ def _write_nas_snapshot(job: dict) -> str:
 # routes
 # --------------------------------------------------------------------------- #
 @app.post("/jobs", status_code=201)
-def create_job(req: JobRequest, requested_by: str = Depends(require_token)) -> dict:
+def create_job(req: JobRequest, requested_by: str = Depends(authn.actor("operator"))) -> dict:
     job_id = _new_job_id(req.job_type)
     job = {
         "job_id": job_id,
@@ -178,7 +178,7 @@ def create_job(req: JobRequest, requested_by: str = Depends(require_token)) -> d
 
 
 @app.get("/jobs/{job_id}")
-def read_job(job_id: str, _: str = Depends(require_token)) -> dict:
+def read_job(job_id: str, _: str = Depends(authn.actor("viewer"))) -> dict:
     job = db.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
@@ -186,7 +186,7 @@ def read_job(job_id: str, _: str = Depends(require_token)) -> dict:
 
 
 @app.get("/jobs/{job_id}/events")
-def read_job_events(job_id: str, _: str = Depends(require_token)) -> list[dict]:
+def read_job_events(job_id: str, _: str = Depends(authn.actor("viewer"))) -> list[dict]:
     if db.get_job(job_id) is None:
         raise HTTPException(status_code=404, detail="job not found")
     return db.list_job_events(job_id)
@@ -202,7 +202,7 @@ def read_jobs(
     worker: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
-    _: str = Depends(require_token),
+    _: str = Depends(authn.actor("viewer")),
 ) -> list[dict]:
     # body stays a plain list (backward-compatible with the CLI); total for the
     # web UI's pagination goes in a header.
@@ -213,7 +213,7 @@ def read_jobs(
 
 
 @app.post("/jobs/{job_id}/cancel")
-def cancel_job(job_id: str, who: str = Depends(require_token)) -> dict:
+def cancel_job(job_id: str, who: str = Depends(authn.actor("operator"))) -> dict:
     """Best-effort cancel: mark the job cancelled and kill its container if running."""
     job = db.get_job(job_id)
     if job is None:
@@ -233,13 +233,13 @@ def cancel_job(job_id: str, who: str = Depends(require_token)) -> dict:
 
 
 @app.post("/workers/{name}/heartbeat")
-def worker_heartbeat(name: str, _: str = Depends(require_token)) -> dict:
+def worker_heartbeat(name: str, _: str = Depends(authn.actor("operator"))) -> dict:
     db.heartbeat(name)
     return {"worker": name, "ok": True}
 
 
 @app.post("/jobs/{job_id}/status")
-def report_status(job_id: str, upd: StatusUpdate, _: str = Depends(require_token)) -> dict:
+def report_status(job_id: str, upd: StatusUpdate, _: str = Depends(authn.actor("operator"))) -> dict:
     if db.get_job(job_id) is None:
         raise HTTPException(status_code=404, detail="job not found")
     db.update_status(
@@ -255,20 +255,20 @@ def report_status(job_id: str, upd: StatusUpdate, _: str = Depends(require_token
 
 
 @app.post("/locks/{name}/acquire")
-def acquire_lock(name: str, body: LockAcquire, _: str = Depends(require_token)) -> dict:
+def acquire_lock(name: str, body: LockAcquire, _: str = Depends(authn.actor("operator"))) -> dict:
     """Take a named resource lock (e.g. 'training'). Returns whether it was granted."""
     granted = db.acquire_lock(name, body.holder, body.job_id)
     return {"lock": name, "acquired": granted}
 
 
 @app.post("/locks/{name}/release")
-def release_lock(name: str, body: LockRelease, _: str = Depends(require_token)) -> dict:
+def release_lock(name: str, body: LockRelease, _: str = Depends(authn.actor("operator"))) -> dict:
     released = db.release_lock(name, body.job_id)
     return {"lock": name, "released": released}
 
 
 @app.get("/locks/{name}")
-def read_lock(name: str, _: str = Depends(require_token)) -> dict:
+def read_lock(name: str, _: str = Depends(authn.actor("viewer"))) -> dict:
     return db.get_lock(name) or {"lock": name, "held": False}
 
 
@@ -276,24 +276,24 @@ def read_lock(name: str, _: str = Depends(require_token)) -> dict:
 # model registry — promote / rollback (production control)
 # --------------------------------------------------------------------------- #
 @app.get("/models")
-def list_models(_: str = Depends(require_token)) -> dict:
+def list_models(_: str = Depends(authn.actor("viewer"))) -> dict:
     return {"models": reg.list_models()}
 
 
 @app.get("/models/{model}")
-def read_model(model: str, _: str = Depends(require_token)) -> dict:
+def read_model(model: str, _: str = Depends(authn.actor("viewer"))) -> dict:
     if model not in reg.list_models():
         raise HTTPException(status_code=404, detail="model not found")
     return reg.get_model_summary(model)
 
 
 @app.get("/models/{model}/versions")
-def list_versions(model: str, _: str = Depends(require_token)) -> list[dict]:
+def list_versions(model: str, _: str = Depends(authn.actor("viewer"))) -> list[dict]:
     return reg.list_versions(model)
 
 
 @app.get("/models/{model}/versions/{version}")
-def read_model_version(model: str, version: str, _: str = Depends(require_token)) -> dict:
+def read_model_version(model: str, version: str, _: str = Depends(authn.actor("viewer"))) -> dict:
     v = reg.get_version(model, version)
     if v is None:
         raise HTTPException(status_code=404, detail="version not found")
@@ -301,12 +301,12 @@ def read_model_version(model: str, version: str, _: str = Depends(require_token)
 
 
 @app.get("/models/{model}/active")
-def active_model(model: str, _: str = Depends(require_token)) -> dict:
+def active_model(model: str, _: str = Depends(authn.actor("viewer"))) -> dict:
     return reg.get_active(model) or {"model": model, "active_version": None}
 
 
 @app.post("/models/{model}/promote")
-def promote_model(model: str, body: PromoteBody, who: str = Depends(require_token)) -> dict:
+def promote_model(model: str, body: PromoteBody, who: str = Depends(authn.actor("admin"))) -> dict:
     try:
         res = reg.promote(model, body.version, who, body.reason)
     except reg.RegistryError as exc:
@@ -316,7 +316,7 @@ def promote_model(model: str, body: PromoteBody, who: str = Depends(require_toke
 
 
 @app.post("/models/{model}/rollback")
-def rollback_model(model: str, body: RollbackBody, who: str = Depends(require_token)) -> dict:
+def rollback_model(model: str, body: RollbackBody, who: str = Depends(authn.actor("admin"))) -> dict:
     try:
         res = reg.rollback(model, body.to, who, body.reason)
     except reg.RegistryError as exc:
@@ -327,7 +327,7 @@ def rollback_model(model: str, body: RollbackBody, who: str = Depends(require_to
 
 
 @app.get("/audit")
-def read_audit(limit: int = 50, _: str = Depends(require_token)) -> list[dict]:
+def read_audit(limit: int = 50, _: str = Depends(authn.actor("viewer"))) -> list[dict]:
     return db.list_audit(limit=limit)
 
 
@@ -427,7 +427,7 @@ def _import_public(imp: dict) -> dict:
 
 
 @app.post("/datasets/imports", status_code=201)
-def create_dataset_import(req: DatasetImportRequest, requested_by: str = Depends(require_token)) -> dict:
+def create_dataset_import(req: DatasetImportRequest, requested_by: str = Depends(authn.actor("operator"))) -> dict:
     if req.source_type not in DATASET_SOURCE_TYPES:
         raise HTTPException(status_code=422, detail=f"unsupported source_type: {req.source_type!r}")
     if not _DATASET_NAME_RE.match(req.dataset_name):
@@ -484,13 +484,13 @@ def create_dataset_import(req: DatasetImportRequest, requested_by: str = Depends
 @app.get("/datasets/imports")
 def list_dataset_imports(response: Response, state: Optional[str] = None,
                          dataset_name: Optional[str] = None, limit: int = 50, offset: int = 0,
-                         _: str = Depends(require_token)) -> list[dict]:
+                         _: str = Depends(authn.actor("viewer"))) -> list[dict]:
     response.headers["X-Total-Count"] = str(db.count_dataset_imports(state, dataset_name))
     return [_import_public(r) for r in db.list_dataset_imports(state, dataset_name, limit, offset)]
 
 
 @app.get("/datasets/imports/{import_id}")
-def get_dataset_import(import_id: str, _: str = Depends(require_token)) -> dict:
+def get_dataset_import(import_id: str, _: str = Depends(authn.actor("viewer"))) -> dict:
     imp = db.get_dataset_import(import_id)
     if imp is None:
         raise HTTPException(status_code=404, detail="import not found")
@@ -500,7 +500,7 @@ def get_dataset_import(import_id: str, _: str = Depends(require_token)) -> dict:
 
 
 @app.post("/datasets/imports/{import_id}/cancel")
-def cancel_dataset_import(import_id: str, who: str = Depends(require_token)) -> dict:
+def cancel_dataset_import(import_id: str, who: str = Depends(authn.actor("operator"))) -> dict:
     imp = db.get_dataset_import(import_id)
     if imp is None:
         raise HTTPException(status_code=404, detail="import not found")
@@ -527,7 +527,7 @@ class DatasetStateUpdate(BaseModel):
 
 @app.post("/datasets/imports/{import_id}/state")
 def report_dataset_state(import_id: str, upd: DatasetStateUpdate,
-                         who: str = Depends(require_token)) -> dict:
+                         who: str = Depends(authn.actor("operator"))) -> dict:
     """Dataset-worker callback. The worker never writes the DB directly — it
     reports transitions here, mirroring the GPU worker's /jobs/{id}/status."""
     if upd.state not in DATASET_STATES:
@@ -548,7 +548,7 @@ class LicenseDecision(BaseModel):
 
 
 @app.post("/datasets/imports/{import_id}/approve-license")
-def approve_license(import_id: str, body: LicenseDecision, who: str = Depends(require_token)) -> dict:
+def approve_license(import_id: str, body: LicenseDecision, who: str = Depends(authn.actor("admin"))) -> dict:
     """Human gate: approve an external dataset's licence and re-enqueue it so
     the worker resumes and freezes it."""
     imp = db.get_dataset_import(import_id)
@@ -575,7 +575,7 @@ def approve_license(import_id: str, body: LicenseDecision, who: str = Depends(re
 
 
 @app.post("/datasets/imports/{import_id}/reject-license")
-def reject_license(import_id: str, body: LicenseDecision, who: str = Depends(require_token)) -> dict:
+def reject_license(import_id: str, body: LicenseDecision, who: str = Depends(authn.actor("admin"))) -> dict:
     imp = db.get_dataset_import(import_id)
     if imp is None:
         raise HTTPException(status_code=404, detail="import not found")
@@ -590,7 +590,7 @@ def reject_license(import_id: str, body: LicenseDecision, who: str = Depends(req
 
 
 @app.get("/datasets")
-def list_datasets(_: str = Depends(require_token)) -> dict:
+def list_datasets(_: str = Depends(authn.actor("viewer"))) -> dict:
     return {"datasets": db.list_datasets()}
 
 
@@ -651,7 +651,7 @@ def _scan_frozen_datasets() -> list[tuple[str, str, Path]]:
 
 
 @app.post("/datasets/backfill")
-def backfill_datasets(dry_run: bool = True, who: str = Depends(require_token)) -> dict:
+def backfill_datasets(dry_run: bool = True, who: str = Depends(authn.actor("admin"))) -> dict:
     """Index pre-existing frozen datasets (legacy) into the version registry.
     Idempotent; dry_run=true (default) reports without writing. Never edits files."""
     report: dict = {"dry_run": dry_run, "scanned": 0, "already_indexed": 0,
@@ -696,7 +696,7 @@ class VersionFinalizeRequest(BaseModel):
 
 @app.post("/datasets/{dataset_name}/versions/allocate")
 def allocate_dataset_version(dataset_name: str, req: VersionAllocateRequest,
-                             who: str = Depends(require_token)) -> dict:
+                             who: str = Depends(authn.actor("operator"))) -> dict:
     """Worker callback: atomically reserve the next version. Returns the version
     string and the NAS path the worker must freeze into."""
     if not _DATASET_NAME_RE.match(dataset_name):
@@ -717,7 +717,7 @@ def allocate_dataset_version(dataset_name: str, req: VersionAllocateRequest,
 
 @app.post("/datasets/{dataset_name}/versions/{version}/finalize")
 def finalize_dataset_version(dataset_name: str, version: str, req: VersionFinalizeRequest,
-                             who: str = Depends(require_token)) -> dict:
+                             who: str = Depends(authn.actor("operator"))) -> dict:
     """Worker callback: publish a reserved version (make it visible) and flip
     the import to frozen."""
     nas_path = str(Path(NAS_DATASETS_ROOT) / dataset_name / version)
@@ -731,12 +731,12 @@ def finalize_dataset_version(dataset_name: str, version: str, req: VersionFinali
 
 
 @app.get("/datasets/{dataset_name}/versions")
-def list_dataset_versions(dataset_name: str, _: str = Depends(require_token)) -> list[dict]:
+def list_dataset_versions(dataset_name: str, _: str = Depends(authn.actor("viewer"))) -> list[dict]:
     return db.list_dataset_versions(dataset_name)
 
 
 @app.get("/datasets/{dataset_name}/versions/{version}")
-def get_dataset_version(dataset_name: str, version: str, _: str = Depends(require_token)) -> dict:
+def get_dataset_version(dataset_name: str, version: str, _: str = Depends(authn.actor("viewer"))) -> dict:
     v = db.get_dataset_version(dataset_name, version)
     if v is None:
         raise HTTPException(status_code=404, detail="version not found")
@@ -767,7 +767,7 @@ def metrics() -> Response:
 
 
 @app.get("/workers")
-def read_workers(_: str = Depends(require_token)) -> list[dict]:
+def read_workers(_: str = Depends(authn.actor("viewer"))) -> list[dict]:
     now = datetime.now(timezone.utc)
     out = []
     for w in db.list_workers():
@@ -809,7 +809,7 @@ def _query_gpus() -> list[dict]:
 
 
 @app.get("/gpus")
-def read_gpus(_: str = Depends(require_token)) -> list[dict]:
+def read_gpus(_: str = Depends(authn.actor("viewer"))) -> list[dict]:
     return _query_gpus()
 
 
