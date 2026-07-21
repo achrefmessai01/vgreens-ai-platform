@@ -531,12 +531,73 @@ def update_dataset_import(import_id: str, state: str, **fields) -> bool:
         return cur.rowcount > 0
 
 
-# ---- frozen-version index (registration happens at freeze time, 5B.4) ----
+# ---- frozen-version index -------------------------------------------------- #
+# A row is RESERVED at allocate time (nas_path NULL) and only becomes visible
+# once finalize sets nas_path — so a crashed freeze never appears as a real
+# version. UNIQUE(dataset_name, version) makes allocation atomic.
+import re as _re
+
+_VERSION_RE = _re.compile(r"^v(\d+)$")
+
+
+def allocate_dataset_version(dataset_name: str, requested: str | None,
+                             import_id: str, meta: dict) -> str:
+    """Atomically reserve the next version (or an explicit one). Returns the
+    version string. Raises ValueError if `requested` already exists."""
+    conn = _lock_conn()                       # autocommit; we drive BEGIN IMMEDIATE
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        rows = conn.execute(
+            "SELECT version FROM dataset_versions WHERE dataset_name = ?", (dataset_name,)
+        ).fetchall()
+        existing = {r["version"] for r in rows}
+        if requested:
+            if requested in existing:
+                conn.execute("COMMIT;")
+                raise ValueError(f"version {requested} already exists")
+            version = requested
+        else:
+            nums = [int(m.group(1)) for v in existing if (m := _VERSION_RE.match(v))]
+            version = f"v{(max(nums) + 1) if nums else 1}"
+        conn.execute(
+            "INSERT INTO dataset_versions(dataset_name, version, task, import_id, "
+            "content_digest, image_count, class_count, licence_name, licence_status, "
+            "nas_path, frozen_at, frozen_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (dataset_name, version, meta.get("task"), import_id, None,
+             meta.get("image_count"), meta.get("class_count"),
+             meta.get("licence_name"), meta.get("licence_status"),
+             None, now_iso(), meta.get("frozen_by")),
+        )
+        conn.execute("COMMIT;")
+        return version
+    finally:
+        conn.close()
+
+
+def finalize_dataset_version(dataset_name: str, version: str, nas_path: str,
+                             content_digest: str, image_count: int | None = None,
+                             class_count: int | None = None) -> bool:
+    """Publish a reserved version: set nas_path (makes it visible) + digest."""
+    sets = {"nas_path": nas_path, "content_digest": content_digest}
+    if image_count is not None:
+        sets["image_count"] = image_count
+    if class_count is not None:
+        sets["class_count"] = class_count
+    assignments = ",".join(f"{k} = ?" for k in sets)
+    with _connect() as conn:
+        cur = conn.execute(
+            f"UPDATE dataset_versions SET {assignments} WHERE dataset_name = ? AND version = ?",
+            list(sets.values()) + [dataset_name, version],
+        )
+        return cur.rowcount > 0
+
+
 def list_datasets() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
             "SELECT dataset_name, COUNT(*) AS versions, MAX(frozen_at) AS latest_frozen_at "
-            "FROM dataset_versions GROUP BY dataset_name ORDER BY dataset_name"
+            "FROM dataset_versions WHERE nas_path IS NOT NULL "
+            "GROUP BY dataset_name ORDER BY dataset_name"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -544,7 +605,8 @@ def list_datasets() -> list[dict]:
 def list_dataset_versions(dataset_name: str) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM dataset_versions WHERE dataset_name = ? ORDER BY frozen_at DESC",
+            "SELECT * FROM dataset_versions WHERE dataset_name = ? AND nas_path IS NOT NULL "
+            "ORDER BY frozen_at DESC",
             (dataset_name,),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -553,7 +615,8 @@ def list_dataset_versions(dataset_name: str) -> list[dict]:
 def get_dataset_version(dataset_name: str, version: str) -> dict | None:
     with _connect() as conn:
         r = conn.execute(
-            "SELECT * FROM dataset_versions WHERE dataset_name = ? AND version = ?",
+            "SELECT * FROM dataset_versions WHERE dataset_name = ? AND version = ? "
+            "AND nas_path IS NOT NULL",
             (dataset_name, version),
         ).fetchone()
         return dict(r) if r else None

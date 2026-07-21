@@ -21,13 +21,20 @@ import shutil
 import socket
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pika
 import requests
 
 import dataset_adapters as adapters
+import dataset_audit as audit_mod
+import dataset_freeze as freezelib
 import dataset_safety as safety
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000")
 API_TOKEN = os.environ.get("API_TOKEN", "")
@@ -76,6 +83,13 @@ def _get_import(import_id: str) -> dict | None:
         return None
 
 
+def _api_post(path: str, payload: dict) -> dict:
+    r = requests.post(f"{API_URL}{path}", json=payload,
+                      headers={"Authorization": f"Bearer {API_TOKEN}"}, timeout=60)
+    r.raise_for_status()
+    return r.json() if r.content else {}
+
+
 def _heartbeat_loop() -> None:
     while True:
         try:
@@ -94,6 +108,7 @@ def _handle(msg: dict) -> None:
     import_id = msg["import_id"]
     source_type = msg.get("source_type")
     params = msg.get("source_params") or {}
+    dataset_name = msg.get("dataset_name")
 
     # respect a cancellation that landed after the message was queued
     current = _get_import(import_id)
@@ -112,8 +127,73 @@ def _handle(msg: dict) -> None:
     adapter.validate_source(IMPORT_ROOTS)
     adapter.stage(str(raw), IMPORT_ROOTS)
     _report(import_id, "quarantined", detail=f"staged to {raw}")
-    print(f"[dataset-worker] {import_id} quarantined at {raw}", flush=True)
-    # 5B.4 continues here: audit -> normalise -> atomic freeze -> register.
+
+    # ---- audit (fatal findings reject the import) ----
+    _report(import_id, "auditing")
+    report = audit_mod.audit(raw)
+    if report.get("fatal"):
+        fails = [f["msg"] for f in report["findings"] if f["level"] == "fail"]
+        _report(import_id, "rejected", error="audit failed: " + "; ".join(fails[:5]))
+        print(f"[dataset-worker] {import_id} rejected by audit", flush=True)
+        return
+
+    # ---- licence gate (internal local/nas data needs no approval) ----
+    lic = adapter.licence_metadata()
+    if source_type in ("local", "nas"):
+        licence_status = "not_required"
+    else:
+        licence_status = lic.get("approval_status") or "unknown"
+    if licence_status not in ("approved", "not_required"):
+        _report(import_id, "awaiting_license_approval",
+                detail=f"licence '{lic.get('name', 'unknown')}' needs approval")
+        print(f"[dataset-worker] {import_id} awaiting licence approval", flush=True)
+        return
+
+    # ---- normalise to canonical layout ----
+    _report(import_id, "normalising")
+    normalised = stage / "normalised"
+    ninfo = freezelib.normalise(raw, normalised, report["classes"], report["num_classes"])
+    digest, checks = freezelib.hash_tree(normalised)
+
+    # ---- allocate version (the API owns the DB / atomic allocation) ----
+    alloc = _api_post(f"/datasets/{dataset_name}/versions/allocate", {
+        "import_id": import_id,
+        "requested_version": msg.get("requested_version"),
+        "task": "object_detection",
+        "image_count": ninfo["image_count"],
+        "class_count": ninfo["class_count"],
+        "licence_name": lic.get("name"),
+        "licence_status": licence_status,
+    })
+    version, nas_path = alloc["version"], alloc["nas_path"]
+
+    # ---- atomic freeze onto the NAS ----
+    _report(import_id, "freezing", detail=f"version {version}")
+    safe_params = {k: v for k, v in params.items() if k != "licence"}
+    manifest = {
+        "schema_version": 1,
+        "dataset_name": dataset_name,
+        "dataset_version": version,
+        "task": "object_detection",
+        "source": {"type": source_type, **safe_params},
+        "licence": {"name": lic.get("name"), "url": lic.get("url"),
+                    "attribution_required": lic.get("attribution_required"),
+                    "approval_status": licence_status},
+        "content": {"image_count": ninfo["image_count"], "class_count": ninfo["class_count"],
+                    "classes": report["classes"], "content_digest": digest},
+        "generation": {"tool": "vgreens-dataset-factory", "generated_at": _now(),
+                       "import_id": import_id},
+    }
+    source_meta = {"type": source_type, "params": safe_params, "audit_findings": report["findings"]}
+    freezelib.freeze(normalised, nas_path, manifest, checks, report, source_meta)
+
+    # ---- finalize (publishes the version + flips the import to frozen) ----
+    _api_post(f"/datasets/{dataset_name}/versions/{version}/finalize", {
+        "import_id": import_id, "content_digest": digest,
+        "image_count": ninfo["image_count"], "class_count": ninfo["class_count"],
+    })
+    print(f"[dataset-worker] {import_id} FROZEN as {dataset_name}:{version}", flush=True)
+    shutil.rmtree(stage, ignore_errors=True)
 
 
 def _on_message(ch, method, properties, body) -> None:

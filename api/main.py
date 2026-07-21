@@ -32,6 +32,7 @@ from auth import require_token
 
 NAS_JOBS_ROOT = os.environ.get("NAS_JOBS_ROOT", "/mnt/vgreens_storage/ai/jobs")
 NAS_MOUNTPOINT = os.environ.get("NAS_MOUNTPOINT", "/mnt/vgreens_storage")
+NAS_DATASETS_ROOT = os.environ.get("NAS_DATASETS", "/mnt/vgreens_storage/ai/datasets")
 
 VERSION = "0.2.0"        # API version (bumped for Phase 3 additive endpoints)
 API_LEVEL = "v1"         # wire-compat level; bump only on breaking changes
@@ -475,6 +476,59 @@ def report_dataset_state(import_id: str, upd: DatasetStateUpdate,
 @app.get("/datasets")
 def list_datasets(_: str = Depends(require_token)) -> dict:
     return {"datasets": db.list_datasets()}
+
+
+class VersionAllocateRequest(BaseModel):
+    import_id: str
+    requested_version: Optional[str] = None
+    task: Optional[str] = None
+    image_count: Optional[int] = None
+    class_count: Optional[int] = None
+    licence_name: Optional[str] = None
+    licence_status: Optional[str] = None
+
+
+class VersionFinalizeRequest(BaseModel):
+    import_id: str
+    content_digest: str
+    image_count: Optional[int] = None
+    class_count: Optional[int] = None
+
+
+@app.post("/datasets/{dataset_name}/versions/allocate")
+def allocate_dataset_version(dataset_name: str, req: VersionAllocateRequest,
+                             who: str = Depends(require_token)) -> dict:
+    """Worker callback: atomically reserve the next version. Returns the version
+    string and the NAS path the worker must freeze into."""
+    if not _DATASET_NAME_RE.match(dataset_name):
+        raise HTTPException(status_code=422, detail="invalid dataset_name")
+    try:
+        version = db.allocate_dataset_version(
+            dataset_name, req.requested_version, req.import_id,
+            {"task": req.task, "image_count": req.image_count, "class_count": req.class_count,
+             "licence_name": req.licence_name, "licence_status": req.licence_status, "frozen_by": who},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:                       # UNIQUE race / DB error
+        raise HTTPException(status_code=409, detail=f"version allocation failed: {exc}")
+    nas_path = str(Path(NAS_DATASETS_ROOT) / dataset_name / version)
+    return {"dataset_name": dataset_name, "version": version, "nas_path": nas_path}
+
+
+@app.post("/datasets/{dataset_name}/versions/{version}/finalize")
+def finalize_dataset_version(dataset_name: str, version: str, req: VersionFinalizeRequest,
+                             who: str = Depends(require_token)) -> dict:
+    """Worker callback: publish a reserved version (make it visible) and flip
+    the import to frozen."""
+    nas_path = str(Path(NAS_DATASETS_ROOT) / dataset_name / version)
+    ok = db.finalize_dataset_version(dataset_name, version, nas_path,
+                                     req.content_digest, req.image_count, req.class_count)
+    if not ok:
+        raise HTTPException(status_code=404, detail="version not allocated")
+    db.update_dataset_import(req.import_id, "frozen", resolved_version=version)
+    db.add_audit(who, "dataset.freeze", f"{dataset_name}:{version}", source="api")
+    return {"dataset_name": dataset_name, "version": version, "state": "frozen"}
 
 
 @app.get("/datasets/{dataset_name}/versions")
