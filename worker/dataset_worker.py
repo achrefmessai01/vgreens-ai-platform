@@ -137,10 +137,15 @@ def _handle(msg: dict) -> None:
         print(f"[dataset-worker] {import_id} rejected by audit", flush=True)
         return
 
-    # ---- licence gate (internal local/nas data needs no approval) ----
+    # ---- licence gate ----
+    # internal local/nas data is owned (no approval); external sources need an
+    # admin approval, recorded on the import and honoured on the re-run.
     lic = adapter.licence_metadata()
+    stored_status = (current or {}).get("licence_status")
     if source_type in ("local", "nas"):
         licence_status = "not_required"
+    elif stored_status == "approved":
+        licence_status = "approved"
     else:
         licence_status = lic.get("approval_status") or "unknown"
     if licence_status not in ("approved", "not_required"):

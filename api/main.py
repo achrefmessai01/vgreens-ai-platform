@@ -473,6 +473,53 @@ def report_dataset_state(import_id: str, upd: DatasetStateUpdate,
     return {"import_id": import_id, "state": upd.state if ok else imp["state"], "updated": ok}
 
 
+class LicenseDecision(BaseModel):
+    reason: Optional[str] = None
+    licence_name: Optional[str] = None
+
+
+@app.post("/datasets/imports/{import_id}/approve-license")
+def approve_license(import_id: str, body: LicenseDecision, who: str = Depends(require_token)) -> dict:
+    """Human gate: approve an external dataset's licence and re-enqueue it so
+    the worker resumes and freezes it."""
+    imp = db.get_dataset_import(import_id)
+    if imp is None:
+        raise HTTPException(status_code=404, detail="import not found")
+    if imp["state"] in db.DATASET_TERMINAL:
+        raise HTTPException(status_code=409, detail=f"import already {imp['state']}")
+    db.update_dataset_import(
+        import_id, "submitted", licence_status="approved",
+        licence_name=body.licence_name or imp.get("licence_name"),
+        licence_by=who, licence_at=db.now_iso(), detail="licence approved",
+    )
+    try:
+        jobqueue.publish_dataset({
+            "import_id": import_id, "source_type": imp["source_type"],
+            "source_params": json.loads(imp.get("source_params") or "{}"),
+            "dataset_name": imp["dataset_name"], "requested_version": imp.get("requested_version"),
+        })
+    except Exception as exc:
+        db.update_dataset_import(import_id, "failed", error=f"re-publish failed: {exc}")
+        raise HTTPException(status_code=503, detail=f"queue unavailable: {exc}")
+    db.add_audit(who, "dataset.license.approve", import_id, reason=body.reason, source="api")
+    return {"import_id": import_id, "licence_status": "approved", "state": "submitted"}
+
+
+@app.post("/datasets/imports/{import_id}/reject-license")
+def reject_license(import_id: str, body: LicenseDecision, who: str = Depends(require_token)) -> dict:
+    imp = db.get_dataset_import(import_id)
+    if imp is None:
+        raise HTTPException(status_code=404, detail="import not found")
+    if imp["state"] in db.DATASET_TERMINAL:
+        raise HTTPException(status_code=409, detail=f"import already {imp['state']}")
+    db.update_dataset_import(
+        import_id, "rejected", licence_status="rejected", licence_by=who,
+        licence_at=db.now_iso(), error=f"licence rejected: {body.reason or 'no reason given'}",
+    )
+    db.add_audit(who, "dataset.license.reject", import_id, reason=body.reason, source="api")
+    return {"import_id": import_id, "licence_status": "rejected", "state": "rejected"}
+
+
 @app.get("/datasets")
 def list_datasets(_: str = Depends(require_token)) -> dict:
     return {"datasets": db.list_datasets()}
