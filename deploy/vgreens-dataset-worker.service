@@ -1,0 +1,23 @@
+# /etc/systemd/system/vgreens-dataset-worker.service   (Milestone 5B)
+# CPU-only Dataset Factory worker. NOTE: no GPU, no docker — it only stages and
+# (from 5B.4) audits/freezes datasets. Single instance (no @ template).
+[Unit]
+Description=vGreens Dataset Factory worker (CPU-only)
+After=network-online.target vgreens-ai-api.service mount-nas.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vgreens
+WorkingDirectory=/opt/vgreens-ai/repo/worker
+EnvironmentFile=/opt/vgreens-ai/.env
+ExecStart=/opt/vgreens-ai/venv/bin/python dataset_worker.py
+Restart=always
+RestartSec=5
+# CPU-only guardrails: keep dataset imports from starving other work.
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=50
+
+[Install]
+WantedBy=multi-user.target

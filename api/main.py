@@ -441,6 +441,37 @@ def cancel_dataset_import(import_id: str, who: str = Depends(require_token)) -> 
     return {"import_id": import_id, "state": "cancelled"}
 
 
+DATASET_STATES = {
+    "submitted", "downloading", "staging", "quarantined", "auditing",
+    "awaiting_license_approval", "normalising", "freezing", "frozen",
+    "rejected", "failed", "cancelled",
+}
+
+
+class DatasetStateUpdate(BaseModel):
+    state: str
+    detail: Optional[str] = None
+    error: Optional[str] = None
+    resolved_version: Optional[str] = None
+
+
+@app.post("/datasets/imports/{import_id}/state")
+def report_dataset_state(import_id: str, upd: DatasetStateUpdate,
+                         who: str = Depends(require_token)) -> dict:
+    """Dataset-worker callback. The worker never writes the DB directly — it
+    reports transitions here, mirroring the GPU worker's /jobs/{id}/status."""
+    if upd.state not in DATASET_STATES:
+        raise HTTPException(status_code=422, detail=f"invalid state: {upd.state!r}")
+    imp = db.get_dataset_import(import_id)
+    if imp is None:
+        raise HTTPException(status_code=404, detail="import not found")
+    ok = db.update_dataset_import(
+        import_id, upd.state,
+        detail=upd.detail, error=upd.error, resolved_version=upd.resolved_version,
+    )
+    return {"import_id": import_id, "state": upd.state if ok else imp["state"], "updated": ok}
+
+
 @app.get("/datasets")
 def list_datasets(_: str = Depends(require_token)) -> dict:
     return {"datasets": db.list_datasets()}
