@@ -99,6 +99,63 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
     """),
+    (2, "dataset factory: imports + events + versions", """
+        -- one row per dataset import workflow (Dataset Factory)
+        CREATE TABLE IF NOT EXISTS dataset_imports (
+            import_id         TEXT PRIMARY KEY,
+            idempotency_key   TEXT UNIQUE,          -- retries return the same workflow
+            source_type       TEXT NOT NULL,        -- roboflow | local | nas | https | s3
+            source_params     TEXT,                 -- JSON; NEVER secrets/signed URLs
+            dataset_name      TEXT NOT NULL,
+            requested_version TEXT,                 -- optional explicit version
+            resolved_version  TEXT,                 -- allocated atomically at freeze
+            state             TEXT NOT NULL,        -- submitted|downloading|staging|quarantined|
+                                                    -- auditing|awaiting_license_approval|normalising|
+                                                    -- freezing|frozen|rejected|failed|cancelled
+            licence_name      TEXT,
+            licence_status    TEXT,                 -- unknown|approved|rejected|not_required
+            licence_by        TEXT,
+            licence_at        TEXT,
+            requested_by      TEXT,
+            error             TEXT,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dsimports_state ON dataset_imports(state);
+        CREATE INDEX IF NOT EXISTS idx_dsimports_name  ON dataset_imports(dataset_name);
+
+        -- append-only state-transition log (mirrors job_events)
+        CREATE TABLE IF NOT EXISTS dataset_import_events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id  TEXT NOT NULL,
+            ts         TEXT NOT NULL,
+            state      TEXT NOT NULL,
+            detail     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_dsevents_import ON dataset_import_events(import_id);
+
+        -- authoritative index of FROZEN dataset versions. UNIQUE(name,version)
+        -- enforces atomic allocation and "never overwrite a frozen version".
+        -- The NAS holds the bytes + MANIFEST + .complete marker; a row here is
+        -- written only after a successful atomic freeze.
+        CREATE TABLE IF NOT EXISTS dataset_versions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset_name   TEXT NOT NULL,
+            version        TEXT NOT NULL,
+            task           TEXT,
+            import_id      TEXT,
+            content_digest TEXT,
+            image_count    INTEGER,
+            class_count    INTEGER,
+            licence_name   TEXT,
+            licence_status TEXT,
+            nas_path       TEXT,
+            frozen_at      TEXT NOT NULL,
+            frozen_by      TEXT,
+            UNIQUE(dataset_name, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dsversions_name ON dataset_versions(dataset_name);
+    """),
 ]
 
 
