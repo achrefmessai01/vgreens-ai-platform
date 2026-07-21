@@ -28,16 +28,18 @@ def run_container(
     env: dict[str, str],
     log_path: str,
     model_dir: str | None = None,
+    gpu_ids: list[int] | None = None,
     timeout_s: int = 24 * 3600,
 ) -> tuple[int, str]:
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
 
     container_name = f"vgreens-job-{env.get('JOB_ID', 'unknown')}"
+    devices = ",".join(str(g) for g in (gpu_ids or [gpu_id]))   # e.g. "0" or "0,1"
     cmd = [
         "docker", "run", "--rm",
         "--name", container_name,      # so `cancel` can `docker kill` it
-        f"--gpus", f"device={gpu_id}",
+        "--gpus", f"device={devices}",
         "--shm-size", SHM_SIZE,
         "-v", f"{data_dir}:/data:ro",
         "-v", f"{config_path}:/config/job.yaml:ro",

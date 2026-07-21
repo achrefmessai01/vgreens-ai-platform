@@ -205,6 +205,9 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE INDEX IF NOT EXISTS idx_login_ts ON login_events(ts);
     """),
+    (4, "jobs.gpu_count", """
+        ALTER TABLE jobs ADD COLUMN gpu_count INTEGER NOT NULL DEFAULT 1;
+    """),
 ]
 
 
@@ -246,9 +249,9 @@ def insert_job(job: dict) -> None:
         "job_id", "job_type", "model_name", "dataset_name", "dataset_version",
         "tenant", "docker_image", "config_path", "status", "worker", "gpu",
         "requested_by", "priority", "created_at", "started_at", "finished_at",
-        "error", "output_path", "result_version",
+        "error", "output_path", "result_version", "gpu_count",
     )
-    values = [job.get(c) for c in cols]
+    values = [(job.get("gpu_count") or 1) if c == "gpu_count" else job.get(c) for c in cols]
     placeholders = ",".join("?" for _ in cols)
     with _connect() as conn:
         conn.execute(

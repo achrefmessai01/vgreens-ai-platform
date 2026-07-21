@@ -138,7 +138,7 @@ def _active_model_dir(model_name: str) -> tuple[Path | None, str | None]:
     return (vdir, version) if vdir.is_dir() else (None, None)
 
 
-def _handle(job: dict) -> None:
+def _handle(job: dict, gpu_ids: list[int]) -> None:
     job_id = job["job_id"]
     nas_folder = _nas_job_folder(job_id)
     log_path = str(nas_folder / "logs" / "container.log")
@@ -172,6 +172,7 @@ def _handle(job: dict) -> None:
         "MODEL_VERSION": model_version or "",
         "DATASET_VERSION": job.get("dataset_version") or "",
         "TENANT": job.get("tenant") or "",
+        "GPU_COUNT": str(len(gpu_ids)),        # models can use this to train on all GPUs
     }
     config_path = job.get("config_path") or str(work / "job.yaml")
     if not Path(config_path).exists():
@@ -180,7 +181,8 @@ def _handle(job: dict) -> None:
     t0 = time.time()
     code, tail = runner.run_container(
         image=job["docker_image"],
-        gpu_id=GPU_ID,
+        gpu_id=gpu_ids[0],
+        gpu_ids=gpu_ids,
         data_dir=data_dir,
         config_path=config_path,
         out_dir=str(out_dir),
@@ -251,23 +253,33 @@ def _on_message(ch, method, properties, body) -> None:
             ch.basic_ack(delivery_tag=method.delivery_tag)
         return
 
-    # Training lock: only ONE training runs platform-wide, so a GPU always stays
-    # free for production. Processing jobs skip the lock entirely.
-    is_training = job.get("job_type") == "training"
-    if is_training and not _acquire_lock(TRAINING_LOCK, job_id):
-        print(f"[worker] training busy elsewhere — requeueing {job_id}", flush=True)
+    # GPU allocation: every job takes a lock per GPU it needs. A 1-GPU job takes
+    # this worker's GPU; a 2-GPU job takes BOTH (acquired in ascending order,
+    # released on partial failure) so it can't deadlock with the other worker.
+    gpu_count = int(job.get("gpu_count") or 1)
+    needed = [0, 1] if gpu_count == 2 else [GPU_ID]
+    acquired: list[int] = []
+    for g in needed:
+        if _acquire_lock(f"gpu:{g}", job_id):
+            acquired.append(g)
+        else:
+            break
+    if len(acquired) != len(needed):
+        for g in acquired:
+            _release_lock(f"gpu:{g}", job_id)
+        print(f"[worker] GPUs busy for {job_id} (need {needed}) — requeueing", flush=True)
         time.sleep(LOCK_RETRY_SLEEP)
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
         return
 
     try:
-        _handle(job)
+        _handle(job, needed)
     except Exception as exc:  # noqa: BLE001 — report anything, then ack
         print(f"[worker] job {job_id} crashed: {exc}", flush=True)
         _report(job_id, "failed", error=str(exc))
     finally:
-        if is_training:
-            _release_lock(TRAINING_LOCK, job_id)
+        for g in needed:
+            _release_lock(f"gpu:{g}", job_id)
 
     # ack last: if we crash before here, the broker redelivers the job.
     ch.basic_ack(delivery_tag=method.delivery_tag)

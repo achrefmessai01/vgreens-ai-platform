@@ -78,6 +78,7 @@ class JobRequest(BaseModel):
     docker_image: str = Field(..., min_length=1)
     config_path: Optional[str] = None
     priority: int = 0
+    gpu_count: int = 1                 # 1 or 2; 2 requires admin (two-GPU)
 
 
 class StatusUpdate(BaseModel):
@@ -134,7 +135,18 @@ def _write_nas_snapshot(job: dict) -> str:
 # routes
 # --------------------------------------------------------------------------- #
 @app.post("/jobs", status_code=201)
-def create_job(req: JobRequest, requested_by: str = Depends(authn.actor("operator"))) -> dict:
+def create_job(req: JobRequest,
+               ident: Optional[authn.Identity] = Depends(authn.current_identity)) -> dict:
+    if ident is None:
+        raise HTTPException(status_code=401, detail="authentication required")
+    if not authn.role_at_least(ident.role, "operator"):
+        raise HTTPException(status_code=403, detail="requires 'operator' role or higher")
+    if req.gpu_count not in (1, 2):
+        raise HTTPException(status_code=422, detail="gpu_count must be 1 or 2")
+    if req.gpu_count == 2 and not authn.role_at_least(ident.role, "admin"):
+        raise HTTPException(status_code=403,
+                            detail="two-GPU training requires admin (jobs:two_gpu)")
+    requested_by = ident.username
     job_id = _new_job_id(req.job_type)
     job = {
         "job_id": job_id,
@@ -156,6 +168,7 @@ def create_job(req: JobRequest, requested_by: str = Depends(authn.actor("operato
         "error": None,
         "output_path": None,
         "result_version": None,
+        "gpu_count": req.gpu_count,
     }
 
     db.insert_job(job)

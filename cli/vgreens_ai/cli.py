@@ -114,11 +114,12 @@ def _submit(ctx, body: dict):
         output.emit(res, g.output)
 
 
-def _job_train(ctx, model, dataset, image, tenant, config_path):
+def _job_train(ctx, model, dataset, image, tenant, config_path, gpu_count=1):
     name, _, version = (dataset or "").partition(":")
     _submit(ctx, {"job_type": "training", "model_name": model,
                   "dataset_name": name or None, "dataset_version": version or None,
-                  "docker_image": image, "tenant": tenant, "config_path": config_path})
+                  "docker_image": image, "tenant": tenant, "config_path": config_path,
+                  "gpu_count": gpu_count})
 
 
 def _job_process(ctx, model, image, dataset, tenant, config_path):
@@ -161,9 +162,14 @@ def job_train(ctx: typer.Context,
               model: str = typer.Option(..., help="model name"),
               dataset: str = typer.Option(..., help="dataset as name:version"),
               image: str = typer.Option(..., help="docker image"),
-              tenant: str = typer.Option(None), config: str = typer.Option(None, "--config")):
+              tenant: str = typer.Option(None), config: str = typer.Option(None, "--config"),
+              gpu_count: int = typer.Option(1, "--gpu-count", help="1 or 2 (2 = both GPUs, admin only)"),
+              yes: bool = typer.Option(False, "--yes", help="skip the two-GPU confirmation")):
     """Submit a training job."""
-    _job_train(ctx, model, dataset, image, tenant, config)
+    if gpu_count == 2 and not yes and sys.stdout.isatty():
+        typer.confirm("Two-GPU training uses BOTH GPUs — no GPU stays free for production "
+                      "while it runs. Continue?", abort=True)
+    _job_train(ctx, model, dataset, image, tenant, config, gpu_count)
 
 
 @job_app.command("process")
