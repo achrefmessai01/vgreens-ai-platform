@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import typer
 
-from . import __version__, config, output, modelspec
+from . import __version__, config, output, modelspec, modelgen
 from .client import CLIError, Client, EXIT_GENERIC
 
 app = typer.Typer(add_completion=True, no_args_is_help=True,
@@ -325,6 +325,44 @@ def model_presets(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
     output.emit(rows, g.output,
                 columns=[("preset", "preset"), ("task", "task"), ("working code", "working_code")],
                 title="model presets")
+
+
+@model_app.command("onboard")
+def model_onboard(ctx: typer.Context,
+                  spec_path: str = typer.Option(..., "--spec", help="path to model.yaml"),
+                  output_dir: str = typer.Option(None, "--output-dir", help="target dir (default: repo name)"),
+                  dry_run: bool = typer.Option(False, "--dry-run", help="show files, write nothing"),
+                  force: bool = typer.Option(False, "--force", help="overwrite a non-empty dir")):
+    """Generate a model repository from a model.yaml spec."""
+    try:
+        spec = modelspec.load_spec(spec_path)
+    except OSError as exc:
+        raise CLIError(f"cannot read {spec_path}: {exc}", 2)
+    except Exception as exc:  # noqa: BLE001
+        raise CLIError(f"invalid YAML in {spec_path}: {exc}", 2)
+    errors = modelspec.validate(spec)
+    if errors:
+        for e in errors:
+            output.error(e)
+        raise CLIError(f"{len(errors)} problem(s) in the spec", 2)
+
+    out = output_dir or (spec.get("repository", {}).get("name") or spec["model"]["name"])
+    try:
+        files = modelgen.generate(spec, out, dry_run=dry_run, force=force)
+    except FileExistsError as exc:
+        raise CLIError(str(exc), 6)
+    except ValueError as exc:
+        raise CLIError(str(exc), 2)
+
+    verb = "would generate" if dry_run else "generated"
+    output.info(f"{verb} {len(files)} file(s) in [bold]{out}/[/]:")
+    for f in files:
+        output.err.print(f"  {f}")
+    if not dry_run:
+        output.success(f"model repo ready at {out}/")
+        output.info("next: cd in, run `pytest tests/`, then git init / commit / push to GitLab")
+        if modelspec.threshold_state(spec) != "configured":
+            output.warn("thresholds not configured — trained versions will be 'baseline_only'")
 
 
 @model_app.command("validate-spec")
