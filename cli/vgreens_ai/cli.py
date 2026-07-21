@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import typer
 
-from . import __version__, config, output
+from . import __version__, config, output, modelspec
 from .client import CLIError, Client, EXIT_GENERIC
 
 app = typer.Typer(add_completion=True, no_args_is_help=True,
@@ -313,6 +313,39 @@ def model_rollback(ctx: typer.Context, model: str = typer.Argument(...),
         output.warn(f"rolled back {model} -> {res['active_version']}")
     else:
         output.emit(res, g.output)
+
+
+@model_app.command("presets")
+def model_presets(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
+    """List the model onboarding presets."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    rows = [{"preset": k, "task": v["task"], "working_code": v["generates_working_code"]}
+            for k, v in modelspec.PRESETS.items()]
+    output.emit(rows, g.output,
+                columns=[("preset", "preset"), ("task", "task"), ("working code", "working_code")],
+                title="model presets")
+
+
+@model_app.command("validate-spec")
+def model_validate_spec(ctx: typer.Context, path: str = typer.Argument(..., help="path to model.yaml")):
+    """Validate a model.yaml specification."""
+    try:
+        spec = modelspec.load_spec(path)
+    except OSError as exc:
+        raise CLIError(f"cannot read {path}: {exc}", 2)
+    except Exception as exc:  # noqa: BLE001 — yaml parse error
+        raise CLIError(f"invalid YAML in {path}: {exc}", 2)
+    errors = modelspec.validate(spec)
+    if errors:
+        for e in errors:
+            output.error(e)
+        raise CLIError(f"{len(errors)} problem(s) in {path}", 2)
+    state = modelspec.threshold_state(spec)
+    output.success(f"{path} is valid")
+    if state != "configured":
+        output.warn("validation thresholds not configured — a trained version will be "
+                    "'baseline_only' and cannot be promoted until thresholds are set")
 
 
 # --------------------------------------------------------------------------- #

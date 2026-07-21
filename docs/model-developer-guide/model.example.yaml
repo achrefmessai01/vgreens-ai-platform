@@ -1,0 +1,38 @@
+# Example model onboarding spec. Validate with:
+#   vgreens-ai model validate-spec model.example.yaml
+schema_version: 1
+
+model:
+  name: strawberry_ripeness_disease
+  display_name: Strawberry Ripeness and Disease Detection
+  task: object_detection
+  owner: ai-team
+  description: Detect strawberry fruit ripeness and plant-disease conditions.
+
+template:
+  preset: ultralytics_detection      # ultralytics_{detection,classification,segmentation} | custom_python
+  template_version: v1.0.0
+
+dataset:
+  name: strawberry_disease_auto      # a frozen dataset in the registry
+  version: v1                        # explicit version, or 'latest_frozen'
+
+training:
+  base_model: yolo11n.pt
+  epochs: 50
+  image_size: 640
+  batch_size: 16
+  gpu_count: 1                       # 1 or 2 (two-GPU needs the jobs:two_gpu permission)
+  trigger: on_main
+
+validation:
+  thresholds:                        # minimums; null/empty => version is 'baseline_only'
+    mAP50: 0.50
+  thresholds_max: {}
+
+processing:
+  confidence_threshold: 0.30
+
+repository:
+  namespace: achrefmessai            # configurable GitLab namespace
+  name: vgreens-model-strawberry-ripeness-disease
