@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import threading
@@ -35,6 +36,14 @@ import dataset_safety as safety
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_SECRET_RE = re.compile(r"(api_key=)[^\s&\"']+", re.IGNORECASE)
+
+
+def _redact(s) -> str:
+    """Strip any leaked api_key=... from a string before it hits the DB/logs."""
+    return _SECRET_RE.sub(r"\1REDACTED", str(s))
 
 API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000")
 API_TOKEN = os.environ.get("API_TOKEN", "")
@@ -214,19 +223,19 @@ def _on_message(ch, method, properties, body) -> None:
     try:
         _handle(msg)
     except safety.SafetyError as exc:
-        print(f"[dataset-worker] REJECT {import_id}: {exc}", flush=True)
-        _report(import_id, "rejected", error=str(exc))
+        print(f"[dataset-worker] REJECT {import_id}: {_redact(exc)}", flush=True)
+        _report(import_id, "rejected", error=_redact(exc))
     except (ValueError, KeyError) as exc:      # bad request / adapter args — don't retry
-        print(f"[dataset-worker] REJECT {import_id}: {exc}", flush=True)
-        _report(import_id, "rejected", error=str(exc))
+        print(f"[dataset-worker] REJECT {import_id}: {_redact(exc)}", flush=True)
+        _report(import_id, "rejected", error=_redact(exc))
     except Exception as exc:                    # noqa: BLE001 — transient; bounded retry
         headers = (properties.headers or {}) if properties else {}
         attempts = int(headers.get("x-attempts", 0)) + 1
         if attempts >= MAX_ATTEMPTS:
-            print(f"[dataset-worker] FAIL {import_id} after {attempts}x: {exc}", flush=True)
-            _report(import_id, "failed", error=f"{exc} (after {attempts} attempts)")
+            print(f"[dataset-worker] FAIL {import_id} after {attempts}x: {_redact(exc)}", flush=True)
+            _report(import_id, "failed", error=f"{_redact(exc)} (after {attempts} attempts)")
         else:
-            print(f"[dataset-worker] retry {import_id} {attempts}/{MAX_ATTEMPTS}: {exc}", flush=True)
+            print(f"[dataset-worker] retry {import_id} {attempts}/{MAX_ATTEMPTS}: {_redact(exc)}", flush=True)
             ch.basic_publish(exchange="", routing_key=method.routing_key, body=body,
                              properties=pika.BasicProperties(
                                  delivery_mode=2, content_type="application/json",

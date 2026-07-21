@@ -83,11 +83,19 @@ class RoboflowAdapter:
 
     def _export_link(self, ws: str, pr: str, ver: str, key: str,
                      fmt: str = "yolov8", timeout: int = 600) -> str:
+        # NOTE: never include the request URL or `key` in any error/log — the
+        # api_key travels in the query string. Build clean messages by hand.
         url = f"{ROBOFLOW_API}/{ws}/{pr}/{ver}/{fmt}"
         deadline = time.time() + timeout
         while True:
             r = requests.get(url, params={"api_key": key}, timeout=60)
-            r.raise_for_status()
+            if r.status_code == 404:
+                raise RuntimeError(f"roboflow: {ws}/{pr} v{ver} ({fmt}) not found (404) — "
+                                   "check workspace/project/rf_version")
+            if r.status_code in (401, 403):
+                raise RuntimeError("roboflow: authentication failed (check ROBOFLOW_API_KEY)")
+            if not r.ok:
+                raise RuntimeError(f"roboflow export failed: HTTP {r.status_code} for {ws}/{pr} v{ver}")
             data = r.json()
             link = (data.get("export") or {}).get("link")
             if link:
@@ -102,13 +110,14 @@ class RoboflowAdapter:
     def stage(self, dest: str, roots: list[str]):
         ws, pr, ver = self._coords()
         key = os.environ["ROBOFLOW_API_KEY"]
-        link = self._export_link(ws, pr, ver, key)
+        link = self._export_link(ws, pr, ver, key)   # signed URL — never logged
         dest = Path(dest)
         dest.mkdir(parents=True, exist_ok=True)
         zpath = dest.parent / "roboflow_export.zip"
         total = 0
         with requests.get(link, stream=True, timeout=120) as resp:
-            resp.raise_for_status()
+            if not resp.ok:
+                raise RuntimeError(f"roboflow download failed: HTTP {resp.status_code}")
             with open(zpath, "wb") as f:
                 for chunk in resp.iter_content(1024 * 1024):
                     if not chunk:
