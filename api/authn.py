@@ -87,6 +87,15 @@ def revoke_session(raw: str) -> None:
     db.revoke_session(_sha256(raw))
 
 
+# ---- API tokens ----
+def new_api_token() -> tuple[str, str, str]:
+    """Return (token_id, raw_token, token_hash). Show `raw` to the caller once;
+    only the hash is persisted."""
+    token_id = secrets.token_hex(6)
+    raw = "vgt_" + secrets.token_urlsafe(24)
+    return token_id, raw, _sha256(raw)
+
+
 # ---- unified identity resolution ----
 def _from_bearer(token: str) -> Optional[Identity]:
     # DB-backed API token first

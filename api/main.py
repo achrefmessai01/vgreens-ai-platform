@@ -396,6 +396,105 @@ def auth_change_password(body: ChangePasswordBody,
 
 
 # --------------------------------------------------------------------------- #
+# admin: user + API-token management (admin role only)
+# --------------------------------------------------------------------------- #
+class CreateUserBody(BaseModel):
+    username: str
+    password: str
+    role: str = "viewer"
+    display_name: Optional[str] = None
+    email: Optional[str] = None
+
+
+class UpdateUserBody(BaseModel):
+    role: Optional[str] = None
+    active: Optional[bool] = None
+    display_name: Optional[str] = None
+    email: Optional[str] = None
+
+
+class ResetPasswordBody(BaseModel):
+    new_password: str
+
+
+class CreateTokenBody(BaseModel):
+    name: str
+    owner: Optional[str] = None
+    scopes: Optional[str] = None       # space-separated
+    expires_at: Optional[str] = None
+
+
+@app.get("/admin/users")
+def admin_list_users(_: str = Depends(authn.actor("admin"))) -> list[dict]:
+    return db.list_users()
+
+
+@app.post("/admin/users", status_code=201)
+def admin_create_user(body: CreateUserBody, who: str = Depends(authn.actor("admin"))) -> dict:
+    if body.role not in authn.ROLES:
+        raise HTTPException(status_code=422, detail=f"role must be one of {authn.ROLES}")
+    if len(body.password) < 8:
+        raise HTTPException(status_code=422, detail="password must be at least 8 characters")
+    if db.get_user_by_username(body.username) is not None:
+        raise HTTPException(status_code=409, detail="username already exists")
+    uid = db.create_user(body.username, authn.hash_password(body.password), role=body.role,
+                         display_name=body.display_name, email=body.email)
+    db.add_audit(who, "admin.user.create", body.username, reason=body.role, source="api")
+    return db.user_public(db.get_user_by_id(uid))
+
+
+@app.patch("/admin/users/{user_id}")
+def admin_update_user(user_id: int, body: UpdateUserBody, who: str = Depends(authn.actor("admin"))) -> dict:
+    if body.role is not None and body.role not in authn.ROLES:
+        raise HTTPException(status_code=422, detail=f"role must be one of {authn.ROLES}")
+    user = db.get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    db.update_user(user_id, role=body.role,
+                   active=(None if body.active is None else (1 if body.active else 0)),
+                   display_name=body.display_name, email=body.email)
+    db.add_audit(who, "admin.user.update", user["username"], source="api")
+    return db.user_public(db.get_user_by_id(user_id))
+
+
+@app.post("/admin/users/{user_id}/reset-password")
+def admin_reset_password(user_id: int, body: ResetPasswordBody,
+                         who: str = Depends(authn.actor("admin"))) -> dict:
+    user = db.get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    if len(body.new_password) < 8:
+        raise HTTPException(status_code=422, detail="password must be at least 8 characters")
+    db.set_user_password(user_id, authn.hash_password(body.new_password))
+    db.add_audit(who, "admin.user.reset_password", user["username"], source="api")
+    return {"ok": True}
+
+
+@app.get("/admin/tokens")
+def admin_list_tokens(_: str = Depends(authn.actor("admin"))) -> list[dict]:
+    return db.list_api_tokens()
+
+
+@app.post("/admin/tokens", status_code=201)
+def admin_create_token(body: CreateTokenBody, who: str = Depends(authn.actor("admin"))) -> dict:
+    token_id, raw, token_hash = authn.new_api_token()
+    db.create_api_token(token_id, body.name, body.owner or who, token_hash,
+                        body.scopes or "", body.expires_at)
+    db.add_audit(who, "admin.token.create", token_id, reason=body.name, source="api")
+    # the raw token is returned exactly once; only its hash is stored
+    return {"id": token_id, "name": body.name, "owner": body.owner or who,
+            "scopes": body.scopes or "", "token": raw}
+
+
+@app.delete("/admin/tokens/{token_id}")
+def admin_revoke_token(token_id: str, who: str = Depends(authn.actor("admin"))) -> dict:
+    if not db.revoke_api_token(token_id):
+        raise HTTPException(status_code=404, detail="token not found")
+    db.add_audit(who, "admin.token.revoke", token_id, source="api")
+    return {"id": token_id, "revoked": True}
+
+
+# --------------------------------------------------------------------------- #
 # Dataset Factory — import workflows (executed by the CPU dataset worker) and
 # read-only views of frozen dataset versions. The API is the control plane:
 # it writes the import row and publishes to dataset_jobs; the worker consumes.

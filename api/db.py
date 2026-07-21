@@ -704,6 +704,49 @@ def record_login(username: str | None, success: bool, source: str = "api",
         )
 
 
+def list_users() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+        return [user_public(dict(r)) for r in rows]
+
+
+def update_user(user_id: int, **fields) -> bool:
+    allowed = {k: v for k, v in fields.items()
+               if k in ("role", "active", "display_name", "email") and v is not None}
+    if not allowed:
+        return False
+    assignments = ",".join(f"{k} = ?" for k in allowed)
+    with _connect() as conn:
+        cur = conn.execute(f"UPDATE users SET {assignments} WHERE id = ?",
+                           list(allowed.values()) + [user_id])
+        return cur.rowcount > 0
+
+
+def create_api_token(token_id: str, name: str, owner: str, token_hash: str,
+                     scopes: str, expires_at: str | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO api_tokens(id, name, owner, token_hash, scopes, created_at, expires_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (token_id, name, owner, token_hash, scopes, now_iso(), expires_at),
+        )
+
+
+def list_api_tokens() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, name, owner, scopes, created_at, expires_at, last_used, revoked "
+            "FROM api_tokens ORDER BY created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def revoke_api_token(token_id: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("UPDATE api_tokens SET revoked = 1 WHERE id = ?", (token_id,))
+        return cur.rowcount > 0
+
+
 def create_session(token_hash: str, user_id: int, expires_at: str) -> None:
     with _connect() as conn:
         conn.execute(

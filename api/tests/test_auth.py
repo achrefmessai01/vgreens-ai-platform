@@ -82,6 +82,45 @@ def test_rbac_static_token_is_admin():
     assert r.status_code not in (401, 403)          # admin-equivalent; fails later (404/409), not on auth
 
 
+ADMIN_H = {"Authorization": "Bearer statictok"}
+
+
+def test_admin_user_management():
+    client.cookies.clear()
+    r = client.post("/admin/users", headers=ADMIN_H,
+                    json={"username": "webviewer", "password": "viewerpass1", "role": "viewer"})
+    assert r.status_code == 201, r.text
+    uid = r.json()["id"]
+    assert any(u["username"] == "webviewer" for u in client.get("/admin/users", headers=ADMIN_H).json())
+    assert client.patch(f"/admin/users/{uid}", headers=ADMIN_H, json={"role": "operator"}).json()["role"] == "operator"
+    assert client.post(f"/admin/users/{uid}/reset-password", headers=ADMIN_H,
+                       json={"new_password": "newpass123"}).status_code == 200
+    client.cookies.clear()
+    assert client.post("/auth/login", json={"username": "webviewer", "password": "newpass123"}).status_code == 200
+    client.cookies.clear()
+
+
+def test_admin_token_lifecycle():
+    client.cookies.clear()
+    r = client.post("/admin/tokens", headers=ADMIN_H, json={"name": "ci", "scopes": "jobs:submit"})
+    assert r.status_code == 201, r.text
+    raw, tid = r.json()["token"], r.json()["id"]
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {raw}"})
+    assert me.status_code == 200 and me.json()["via"] == "api_token"
+    toks = client.get("/admin/tokens", headers=ADMIN_H).json()
+    assert any(t["id"] == tid for t in toks) and all("token_hash" not in t for t in toks)
+    assert client.delete(f"/admin/tokens/{tid}", headers=ADMIN_H).status_code == 200
+    assert client.get("/auth/me", headers={"Authorization": f"Bearer {raw}"}).status_code == 401
+
+
+def test_admin_requires_admin_role():
+    _mkuser("oo2", "operator")
+    client.cookies.clear()
+    client.post("/auth/login", json={"username": "oo2", "password": "secret123"})
+    assert client.get("/admin/users").status_code == 403
+    client.cookies.clear()
+
+
 def test_change_password_roundtrip():
     client.cookies.clear()
     client.post("/auth/login", json={"username": "admin", "password": "adminpass1"})
