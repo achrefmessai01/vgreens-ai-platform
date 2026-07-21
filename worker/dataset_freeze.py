@@ -24,12 +24,37 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 _SPLIT_MAP = {"train": "train", "valid": "val", "val": "val", "test": "test"}
 
 
+def _clean_label_text(text: str) -> tuple[str, int]:
+    """Drop unusable YOLO lines (too few fields, non-numeric, or zero/negative
+    box size). Returns (cleaned_text, dropped_count)."""
+    kept, dropped = [], 0
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        parts = s.split()
+        if len(parts) < 5:
+            dropped += 1
+            continue
+        try:
+            w, h = float(parts[3]), float(parts[4])
+        except ValueError:
+            dropped += 1
+            continue
+        if w <= 0 or h <= 0:
+            dropped += 1
+            continue
+        kept.append(s)
+    return ("\n".join(kept) + "\n" if kept else ""), dropped
+
+
 def normalise(raw: Path, out: Path, names: list[str], nc: int) -> dict:
     """Copy raw <split>/images|labels into canonical images/<split>, labels/<split>.
     Returns {image_count, class_count, splits}."""
     if out.exists():
         shutil.rmtree(out)
     image_count = 0
+    dropped_boxes = 0
     present: list[str] = []
     for src_split, dst in _SPLIT_MAP.items():
         src_img = raw / src_split / "images"
@@ -41,8 +66,15 @@ def normalise(raw: Path, out: Path, names: list[str], nc: int) -> dict:
         image_count += sum(1 for p in (out / "images" / dst).iterdir()
                            if p.suffix.lower() in IMG_EXTS)
         if src_lbl.is_dir():
-            (out / "labels" / dst).mkdir(parents=True, exist_ok=True)
-            shutil.copytree(src_lbl, out / "labels" / dst, dirs_exist_ok=True)
+            dstlbl = out / "labels" / dst
+            dstlbl.mkdir(parents=True, exist_ok=True)
+            for lf in src_lbl.iterdir():
+                if lf.suffix == ".txt":
+                    cleaned, d = _clean_label_text(lf.read_text())
+                    (dstlbl / lf.name).write_text(cleaned)
+                    dropped_boxes += d
+                elif lf.is_file():
+                    shutil.copy2(lf, dstlbl / lf.name)
         if dst not in present:
             present.append(dst)
 
@@ -52,7 +84,8 @@ def normalise(raw: Path, out: Path, names: list[str], nc: int) -> dict:
     if "test" in present:
         doc["test"] = "images/test"
     (out / "data.yaml").write_text(yaml.safe_dump(doc, sort_keys=False))
-    return {"image_count": image_count, "class_count": nc, "splits": present}
+    return {"image_count": image_count, "class_count": nc, "splits": present,
+            "dropped_boxes": dropped_boxes}
 
 
 def hash_tree(root: Path) -> tuple[str, str]:

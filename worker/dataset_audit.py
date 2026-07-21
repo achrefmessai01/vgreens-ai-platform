@@ -24,8 +24,8 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 DEFAULT_POLICY = {
     "corrupt_images": "fail",
-    "invalid_labels": "fail",     # malformed lines or class id out of range
-    "invalid_boxes": "fail",      # degenerate: zero/negative width or height
+    "invalid_labels": "fail",     # malformed lines or class id out of range (unfixable)
+    "degenerate_boxes": "warn",   # zero/negative size — normalise drops these lines
     "oob_boxes": "warn",          # box extends past the frame edge (YOLO clips these)
     "split_leakage": "fail",      # same image in >1 split
     "missing_labels": "warn",
@@ -136,9 +136,9 @@ def audit(root: Path, policy: dict | None = None) -> dict:
                     add("invalid_labels", f"{split}: class id {ci} out of range in {lbl.name}")
                     continue
                 class_instances[ci] = class_instances.get(ci, 0) + 1
-                if w <= 0 or hh <= 0:                     # degenerate -> fatal
+                if w <= 0 or hh <= 0:                     # degenerate -> normalise drops it
                     n_badbox += 1
-                    add("invalid_boxes", f"{split}: zero/negative-size box in {lbl.name}")
+                    add("degenerate_boxes", f"{split}: zero/negative-size box in {lbl.name}")
                 elif (x < -_BOX_EPS or x > 1 + _BOX_EPS or y < -_BOX_EPS or y > 1 + _BOX_EPS
                       or w > 1 + _BOX_EPS or hh > 1 + _BOX_EPS):   # past the edge -> warn (clipped)
                     n_badbox += 1

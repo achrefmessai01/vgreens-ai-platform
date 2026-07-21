@@ -197,7 +197,8 @@ def _handle(msg: dict) -> None:
         "content": {"image_count": ninfo["image_count"], "class_count": ninfo["class_count"],
                     "classes": report["classes"], "content_digest": digest},
         "generation": {"tool": "vgreens-dataset-factory", "generated_at": _now(),
-                       "import_id": import_id},
+                       "import_id": import_id,
+                       "label_cleaning": {"dropped_boxes": ninfo.get("dropped_boxes", 0)}},
     }
     source_meta = {"type": source_type, "params": safe_params, "audit_findings": report["findings"]}
     freezelib.freeze(normalised, nas_path, manifest, checks, report, source_meta)
