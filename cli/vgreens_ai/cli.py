@@ -479,18 +479,222 @@ def config_use(profile: str = typer.Argument(...)):
 
 
 # --------------------------------------------------------------------------- #
-# dataset group (forward-compatible: works once the server exposes /datasets)
+# dataset group — the Dataset Factory (import -> audit -> licence -> freeze)
 # --------------------------------------------------------------------------- #
-@dataset_app.command("list")
-def dataset_list(ctx: typer.Context):
-    """List datasets (requires server support)."""
+DS_COLS = [("dataset", "dataset_name"), ("versions", "versions"), ("latest_frozen", "latest_frozen_at")]
+DSV_COLS = [("version", "version"), ("task", "task"), ("images", "image_count"),
+            ("classes", "class_count"), ("licence", "licence_status"),
+            ("digest", "content_digest"), ("frozen", "frozen_at")]
+IMP_COLS = [("import_id", "import_id"), ("dataset", "dataset_name"), ("source", "source_type"),
+            ("state", "state"), ("created", "created_at")]
+# states at which `--wait`/`watch` stops (terminal, or the human licence pause)
+DATASET_WAIT_STOP = {"frozen", "rejected", "failed", "cancelled", "awaiting_license_approval"}
+
+dataset_import_app = typer.Typer(no_args_is_help=True, help="Import a dataset from a source.")
+dataset_app.add_typer(dataset_import_app, name="import")
+
+
+def _dataset_wait(ctx: typer.Context, import_id: str, interval: float, wait_timeout: float) -> dict:
+    c = _client(ctx)
+    last = None
+    deadline = time.time() + wait_timeout if wait_timeout else None
+    while True:
+        imp = c.get(f"/datasets/imports/{import_id}")
+        st = imp.get("state")
+        if st != last:
+            output.info(f"{import_id}: {output.badge(st)}")
+            last = st
+        if st in DATASET_WAIT_STOP:
+            if st == "frozen":
+                output.success(f"frozen as {imp['dataset_name']}:{imp.get('resolved_version')}")
+            elif st == "awaiting_license_approval":
+                output.warn(f"awaiting licence approval — an admin must run "
+                            f"`vgreens-ai dataset approve-license {import_id}`")
+            else:
+                raise CLIError(f"import {st}: {imp.get('error') or ''}".strip(), 1)
+            return imp
+        if deadline and time.time() > deadline:
+            raise CLIError(f"timed out waiting for {import_id} (last state: {st})", 1)
+        time.sleep(interval)
+
+
+def _dataset_submit(ctx: typer.Context, body: dict, wait: bool, interval: float, wait_timeout: float):
     g: G = ctx.obj
-    try:
-        output.emit(_client(ctx).get("/datasets"), g.output, title="datasets")
-    except CLIError as exc:
-        if exc.code == 5:
-            raise CLIError("the datasets API isn't available on this server yet", 5)
-        raise
+    body = {k: v for k, v in body.items() if v is not None}
+    res = _client(ctx).post("/datasets/imports", json=body, spinner="submitting import…")
+    iid = res["import_id"]
+    if g.output == "table":
+        output.success(f"import queued: {iid} ({res.get('state', 'submitted')})")
+    if wait:
+        final = _dataset_wait(ctx, iid, interval, wait_timeout)
+        if g.output != "table":
+            output.emit(final, g.output)
+    elif g.output != "table":
+        output.emit(res, g.output)
+
+
+@dataset_import_app.command("roboflow")
+def dataset_import_roboflow(
+    ctx: typer.Context,
+    workspace: str = typer.Option(..., help="Roboflow workspace slug"),
+    project: str = typer.Option(..., help="Roboflow project slug"),
+    source_version: int = typer.Option(..., "--source-version", help="Roboflow dataset version number"),
+    name: str = typer.Option(..., help="frozen dataset name (registry key)"),
+    version: Optional[str] = typer.Option(None, "--version", help="explicit frozen version (default: auto vN)"),
+    idempotency_key: Optional[str] = typer.Option(None, "--idempotency-key"),
+    wait: bool = typer.Option(False, "--wait", help="poll until frozen/rejected/awaiting-licence"),
+    interval: float = typer.Option(3.0, help="poll interval (s)"),
+    wait_timeout: float = typer.Option(0.0, "--wait-timeout", help="give up after N s (0 = no limit)"),
+    out: Optional[str] = OUTPUT_OPT,
+):
+    """Import a Roboflow dataset (the API key is server-side; never sent from here)."""
+    _mode(ctx, out)
+    _dataset_submit(ctx, {
+        "source_type": "roboflow", "dataset_name": name,
+        "source": {"workspace": workspace, "project": project, "rf_version": source_version},
+        "requested_version": version, "idempotency_key": idempotency_key,
+    }, wait, interval, wait_timeout)
+
+
+def _import_pathlike(ctx, source_type, path, name, version, idempotency_key, wait, interval, wait_timeout, out):
+    _mode(ctx, out)
+    _dataset_submit(ctx, {
+        "source_type": source_type, "dataset_name": name, "source": {"path": path},
+        "requested_version": version, "idempotency_key": idempotency_key,
+    }, wait, interval, wait_timeout)
+
+
+@dataset_import_app.command("local")
+def dataset_import_local(
+    ctx: typer.Context,
+    path: str = typer.Option(..., help="path to a dataset dir or .zip (must be under an allowlisted root)"),
+    name: str = typer.Option(...), version: Optional[str] = typer.Option(None, "--version"),
+    idempotency_key: Optional[str] = typer.Option(None, "--idempotency-key"),
+    wait: bool = typer.Option(False, "--wait"), interval: float = typer.Option(3.0),
+    wait_timeout: float = typer.Option(0.0, "--wait-timeout"), out: Optional[str] = OUTPUT_OPT,
+):
+    """Import a local/NAS dataset directory or zip archive."""
+    _import_pathlike(ctx, "local", path, name, version, idempotency_key, wait, interval, wait_timeout, out)
+
+
+@dataset_import_app.command("nas")
+def dataset_import_nas(
+    ctx: typer.Context,
+    path: str = typer.Option(..., help="path under an allowlisted NAS root"),
+    name: str = typer.Option(...), version: Optional[str] = typer.Option(None, "--version"),
+    idempotency_key: Optional[str] = typer.Option(None, "--idempotency-key"),
+    wait: bool = typer.Option(False, "--wait"), interval: float = typer.Option(3.0),
+    wait_timeout: float = typer.Option(0.0, "--wait-timeout"), out: Optional[str] = OUTPUT_OPT,
+):
+    """Import a dataset from an allowlisted NAS path."""
+    _import_pathlike(ctx, "nas", path, name, version, idempotency_key, wait, interval, wait_timeout, out)
+
+
+@dataset_app.command("list")
+def dataset_list(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
+    """List frozen datasets."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    res = _client(ctx).get("/datasets")
+    output.emit(res.get("datasets", []), g.output, columns=DS_COLS, title="datasets")
+
+
+@dataset_app.command("versions")
+def dataset_versions(ctx: typer.Context, name: str = typer.Argument(...), out: Optional[str] = OUTPUT_OPT):
+    """List frozen versions of a dataset."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    output.emit(_client(ctx).get(f"/datasets/{name}/versions"), g.output,
+                columns=DSV_COLS, title=f"{name} versions")
+
+
+@dataset_app.command("imports")
+def dataset_imports(ctx: typer.Context, state: str = typer.Option(None),
+                    name: str = typer.Option(None, "--name"), limit: int = typer.Option(20),
+                    out: Optional[str] = OUTPUT_OPT):
+    """List dataset import workflows."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    params = {"limit": limit}
+    if state:
+        params["state"] = state
+    if name:
+        params["dataset_name"] = name
+    output.emit(_client(ctx).get("/datasets/imports", params=params), g.output,
+                columns=IMP_COLS, title="dataset imports")
+
+
+@dataset_app.command("show")
+def dataset_show(ctx: typer.Context, import_id: str = typer.Argument(...), out: Optional[str] = OUTPUT_OPT):
+    """Show a dataset import workflow with its event timeline."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    imp = _client(ctx).get(f"/datasets/imports/{import_id}")
+    if g.output != "table":
+        output.emit(imp, g.output)
+        return
+    events = imp.pop("events", [])
+    output.emit(imp, g.output, title=import_id)
+    output.emit(events, g.output,
+                columns=[("time", "ts"), ("state", "state"), ("detail", "detail")], title="events")
+
+
+@dataset_app.command("events")
+def dataset_events(ctx: typer.Context, import_id: str = typer.Argument(...), out: Optional[str] = OUTPUT_OPT):
+    """Show a dataset import's event timeline."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    imp = _client(ctx).get(f"/datasets/imports/{import_id}")
+    output.emit(imp.get("events", []), g.output,
+                columns=[("time", "ts"), ("state", "state"), ("detail", "detail")],
+                title=f"{import_id} events")
+
+
+@dataset_app.command("watch")
+def dataset_watch(ctx: typer.Context, import_id: str = typer.Argument(...),
+                  interval: float = typer.Option(3.0, help="poll interval (s)"),
+                  wait_timeout: float = typer.Option(0.0, "--wait-timeout")):
+    """Poll a dataset import until it freezes, is rejected, or awaits licence approval."""
+    _dataset_wait(ctx, import_id, interval, wait_timeout)
+
+
+@dataset_app.command("approve-license")
+def dataset_approve_license(ctx: typer.Context, import_id: str = typer.Argument(...),
+                            reason: str = typer.Option(None),
+                            licence_name: str = typer.Option(None, "--licence-name")):
+    """Approve an external dataset's licence (admin) — re-queues it to freeze."""
+    g: G = ctx.obj
+    res = _client(ctx).post(f"/datasets/imports/{import_id}/approve-license",
+                            json={"reason": reason, "licence_name": licence_name},
+                            spinner="approving licence…")
+    if g.output == "table":
+        output.success(f"licence approved for {import_id}; re-queued")
+    else:
+        output.emit(res, g.output)
+
+
+@dataset_app.command("reject-license")
+def dataset_reject_license(ctx: typer.Context, import_id: str = typer.Argument(...),
+                           reason: str = typer.Option(None)):
+    """Reject an external dataset's licence (admin) — the import is rejected."""
+    g: G = ctx.obj
+    res = _client(ctx).post(f"/datasets/imports/{import_id}/reject-license",
+                            json={"reason": reason}, spinner="rejecting licence…")
+    if g.output == "table":
+        output.warn(f"licence rejected for {import_id}")
+    else:
+        output.emit(res, g.output)
+
+
+@dataset_app.command("cancel")
+def dataset_cancel(ctx: typer.Context, import_id: str = typer.Argument(...)):
+    """Cancel a dataset import (best-effort)."""
+    g: G = ctx.obj
+    res = _client(ctx).post(f"/datasets/imports/{import_id}/cancel", spinner="cancelling…")
+    if g.output == "table":
+        output.warn(f"{res.get('state', 'cancelled')} {import_id}")
+    else:
+        output.emit(res, g.output)
 
 
 # --------------------------------------------------------------------------- #

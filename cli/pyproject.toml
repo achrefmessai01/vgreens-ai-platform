@@ -1,6 +1,6 @@
 [project]
 name = "vgreens-ai"
-version = "0.2.0"
+version = "0.3.0"
 description = "vGreens AI platform CLI — a client over the Job API"
 requires-python = ">=3.10"
 dependencies = [
