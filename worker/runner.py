@@ -35,11 +35,15 @@ def run_container(
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
 
     container_name = f"vgreens-job-{env.get('JOB_ID', 'unknown')}"
-    devices = ",".join(str(g) for g in (gpu_ids or [gpu_id]))   # e.g. "0" or "0,1"
+    ids = gpu_ids or [gpu_id]
+    devices = ",".join(str(g) for g in ids)
+    # A multi-device list must be quoted ("device=0,1") or docker treats the comma
+    # as an option separator and errors with "cannot set both Count and DeviceIDs".
+    gpus_val = f'"device={devices}"' if len(ids) > 1 else f"device={devices}"
     cmd = [
         "docker", "run", "--rm",
         "--name", container_name,      # so `cancel` can `docker kill` it
-        "--gpus", f"device={devices}",
+        "--gpus", gpus_val,
         "--shm-size", SHM_SIZE,
         "-v", f"{data_dir}:/data:ro",
         "-v", f"{config_path}:/config/job.yaml:ro",
