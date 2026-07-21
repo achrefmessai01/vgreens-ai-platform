@@ -592,6 +592,28 @@ def finalize_dataset_version(dataset_name: str, version: str, nas_path: str,
         return cur.rowcount > 0
 
 
+def register_backfill_version(dataset_name: str, version: str, nas_path: str, meta: dict) -> bool:
+    """Index a pre-existing frozen version (legacy backfill). Inserts a visible
+    row (nas_path set) if that (name, version) isn't already indexed. Returns
+    True if inserted, False if it already existed. Never touches files."""
+    with _connect() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM dataset_versions WHERE dataset_name = ? AND version = ?",
+            (dataset_name, version),
+        ).fetchone()
+        if exists:
+            return False
+        conn.execute(
+            "INSERT INTO dataset_versions(dataset_name, version, task, import_id, "
+            "content_digest, image_count, class_count, licence_name, licence_status, "
+            "nas_path, frozen_at, frozen_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (dataset_name, version, meta.get("task"), None, meta.get("content_digest"),
+             meta.get("image_count"), meta.get("class_count"), meta.get("licence_name"),
+             meta.get("licence_status"), nas_path, meta.get("frozen_at") or now_iso(), "backfill"),
+        )
+        return True
+
+
 def list_datasets() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(

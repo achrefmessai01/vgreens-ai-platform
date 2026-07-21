@@ -33,6 +33,11 @@ class FakeClient:
 
     def post(self, path, json=None, spinner=None):
         self.calls.append(("POST", path, json))
+        if "backfill" in path:
+            return {"dry_run": "dry_run=true" in path, "scanned": 3, "already_indexed": 1,
+                    "added": [{"dataset_name": "legacy_ds", "version": "v1",
+                               "image_count": 5, "class_count": 2, "metadata_source": "inferred"}],
+                    "errors": []}
         return {"import_id": "imp1", "state": "submitted"}
 
 
@@ -86,3 +91,19 @@ def test_approve_license_posts(monkeypatch):
     post = next(c for c in fake.calls if c[0] == "POST")
     assert post[1] == "/datasets/imports/imp1/approve-license"
     assert post[2]["reason"] == "ok"
+
+
+def test_backfill_dry_run_by_default(monkeypatch):
+    fake = _patch(monkeypatch)
+    r = runner.invoke(cli.app, ["dataset", "backfill"])
+    assert r.exit_code == 0, r.output
+    post = next(c for c in fake.calls if c[0] == "POST")
+    assert post[1] == "/datasets/backfill?dry_run=true"
+
+
+def test_backfill_apply(monkeypatch):
+    fake = _patch(monkeypatch)
+    r = runner.invoke(cli.app, ["dataset", "backfill", "--apply"])
+    assert r.exit_code == 0, r.output
+    post = next(c for c in fake.calls if c[0] == "POST")
+    assert post[1] == "/datasets/backfill?dry_run=false"

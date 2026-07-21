@@ -525,6 +525,89 @@ def list_datasets(_: str = Depends(require_token)) -> dict:
     return {"datasets": db.list_datasets()}
 
 
+# ---- legacy backfill: index pre-existing frozen datasets on the NAS -------- #
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _dataset_meta_from_dir(ver_dir: Path) -> dict:
+    """Prefer MANIFEST.json; otherwise infer counts by scanning the version dir."""
+    manifest = ver_dir / "MANIFEST.json"
+    if manifest.is_file():
+        try:
+            m = json.loads(manifest.read_text())
+            content = m.get("content") or {}
+            return {
+                "task": m.get("task"),
+                "image_count": content.get("image_count"),
+                "class_count": content.get("class_count"),
+                "content_digest": content.get("content_digest"),
+                "licence_status": (m.get("licence") or {}).get("approval_status"),
+                "frozen_at": (m.get("generation") or {}).get("generated_at"),
+                "metadata_source": "manifest",
+            }
+        except (json.JSONDecodeError, OSError):
+            pass
+    # infer
+    n_images = sum(1 for p in ver_dir.rglob("*") if p.suffix.lower() in _IMG_EXTS)
+    nc = None
+    dy = ver_dir / "data.yaml"
+    if dy.is_file():
+        try:
+            import yaml
+            doc = yaml.safe_load(dy.read_text()) or {}
+            names = doc.get("names")
+            nc = doc.get("nc", len(names) if isinstance(names, list) else None)
+        except Exception:  # noqa: BLE001
+            pass
+    return {"task": None, "image_count": n_images, "class_count": nc,
+            "content_digest": None, "licence_status": "legacy",
+            "frozen_at": None, "metadata_source": "inferred"}
+
+
+def _scan_frozen_datasets() -> list[tuple[str, str, Path]]:
+    root = Path(NAS_DATASETS_ROOT)
+    out: list[tuple[str, str, Path]] = []
+    if not root.is_dir():
+        return out
+    for ds_dir in sorted(root.iterdir()):
+        if not ds_dir.is_dir():
+            continue
+        for ver_dir in sorted(ds_dir.iterdir()):
+            if not ver_dir.is_dir():
+                continue
+            # a usable frozen version has a completion marker or a data.yaml
+            if (ver_dir / ".complete").exists() or (ver_dir / "data.yaml").is_file():
+                out.append((ds_dir.name, ver_dir.name, ver_dir))
+    return out
+
+
+@app.post("/datasets/backfill")
+def backfill_datasets(dry_run: bool = True, who: str = Depends(require_token)) -> dict:
+    """Index pre-existing frozen datasets (legacy) into the version registry.
+    Idempotent; dry_run=true (default) reports without writing. Never edits files."""
+    report: dict = {"dry_run": dry_run, "scanned": 0, "already_indexed": 0,
+                    "added": [], "errors": []}
+    for name, version, ver_dir in _scan_frozen_datasets():
+        report["scanned"] += 1
+        if db.get_dataset_version(name, version):
+            report["already_indexed"] += 1
+            continue
+        try:
+            meta = _dataset_meta_from_dir(ver_dir)
+        except Exception as exc:  # noqa: BLE001
+            report["errors"].append({"dataset": f"{name}:{version}", "error": str(exc)})
+            continue
+        report["added"].append({
+            "dataset_name": name, "version": version,
+            "image_count": meta.get("image_count"), "class_count": meta.get("class_count"),
+            "metadata_source": meta.get("metadata_source"),
+        })
+        if not dry_run:
+            db.register_backfill_version(name, version, str(ver_dir), meta)
+            db.add_audit(who, "dataset.backfill", f"{name}:{version}", source="api")
+    return report
+
+
 class VersionAllocateRequest(BaseModel):
     import_id: str
     requested_version: Optional[str] = None

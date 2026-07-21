@@ -686,6 +686,32 @@ def dataset_reject_license(ctx: typer.Context, import_id: str = typer.Argument(.
         output.emit(res, g.output)
 
 
+@dataset_app.command("backfill")
+def dataset_backfill(ctx: typer.Context,
+                     apply: bool = typer.Option(False, "--apply",
+                                                help="actually index (default: dry-run report only)"),
+                     out: Optional[str] = OUTPUT_OPT):
+    """Index pre-existing (legacy) frozen datasets into the registry. Admin/ops."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    dry = "false" if apply else "true"
+    res = _client(ctx).post(f"/datasets/backfill?dry_run={dry}", spinner="scanning NAS…")
+    if g.output != "table":
+        output.emit(res, g.output)
+        return
+    added = res.get("added", [])
+    output.emit(added, g.output,
+                columns=[("dataset", "dataset_name"), ("version", "version"),
+                         ("images", "image_count"), ("classes", "class_count"),
+                         ("metadata", "metadata_source")],
+                title=("would add" if res.get("dry_run") else "added"))
+    verb = "would index" if res.get("dry_run") else "indexed"
+    output.info(f"scanned {res.get('scanned', 0)} · already indexed {res.get('already_indexed', 0)} · "
+                f"{verb} {len(added)} · errors {len(res.get('errors', []))}")
+    if res.get("dry_run") and added:
+        output.info("re-run with [bold]--apply[/] to write these records")
+
+
 @dataset_app.command("cancel")
 def dataset_cancel(ctx: typer.Context, import_id: str = typer.Argument(...)):
     """Cancel a dataset import (best-effort)."""
