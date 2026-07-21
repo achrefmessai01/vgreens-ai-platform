@@ -156,6 +156,55 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         );
         CREATE INDEX IF NOT EXISTS idx_dsversions_name ON dataset_versions(dataset_name);
     """),
+    (3, "auth: users + sessions + api_tokens + login_events", """
+        CREATE TABLE IF NOT EXISTS users (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            username      TEXT UNIQUE NOT NULL,
+            display_name  TEXT,
+            email         TEXT,
+            password_hash TEXT NOT NULL,
+            role          TEXT NOT NULL DEFAULT 'viewer',   -- viewer | operator | admin
+            active        INTEGER NOT NULL DEFAULT 1,
+            created_at    TEXT NOT NULL,
+            last_login    TEXT,
+            failed_logins INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- browser sessions. The cookie carries an opaque random token; we store
+        -- only its sha256 hash. Expiring + revocable.
+        CREATE TABLE IF NOT EXISTS sessions (
+            token_hash TEXT PRIMARY KEY,
+            user_id    INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_used  TEXT,
+            revoked    INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+        -- DB-backed API tokens (for CLI/CI), scoped. Raw shown once; store hash.
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            id         TEXT PRIMARY KEY,
+            name       TEXT,
+            owner      TEXT,
+            token_hash TEXT UNIQUE NOT NULL,
+            scopes     TEXT,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            last_used  TEXT,
+            revoked    INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS login_events (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts       TEXT NOT NULL,
+            username TEXT,
+            success  INTEGER NOT NULL,
+            source   TEXT,
+            detail   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_ts ON login_events(ts);
+    """),
 ]
 
 
@@ -590,6 +639,101 @@ def finalize_dataset_version(dataset_name: str, version: str, nas_path: str,
             list(sets.values()) + [dataset_name, version],
         )
         return cur.rowcount > 0
+
+
+# --------------------------------------------------------------------------- #
+# auth: users, sessions, api tokens, login events
+# --------------------------------------------------------------------------- #
+_USER_PUBLIC = ("id", "username", "display_name", "email", "role", "active",
+                "created_at", "last_login")
+
+
+def count_users() -> int:
+    with _connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def create_user(username: str, password_hash: str, role: str = "viewer",
+                display_name: str | None = None, email: str | None = None) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO users(username, display_name, email, password_hash, role, "
+            "active, created_at) VALUES(?,?,?,?,?,1,?)",
+            (username, display_name, email, password_hash, role, now_iso()),
+        )
+        return int(cur.lastrowid)
+
+
+def get_user_by_username(username: str) -> dict | None:
+    with _connect() as conn:
+        r = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        return dict(r) if r else None
+
+
+def get_user_by_id(user_id: int) -> dict | None:
+    with _connect() as conn:
+        r = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(r) if r else None
+
+
+def user_public(user: dict) -> dict:
+    return {k: user.get(k) for k in _USER_PUBLIC}
+
+
+def set_user_password(user_id: int, password_hash: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
+
+
+def note_login_result(user_id: int, success: bool) -> None:
+    with _connect() as conn:
+        if success:
+            conn.execute("UPDATE users SET last_login = ?, failed_logins = 0 WHERE id = ?",
+                         (now_iso(), user_id))
+        else:
+            conn.execute("UPDATE users SET failed_logins = failed_logins + 1 WHERE id = ?",
+                         (user_id,))
+
+
+def record_login(username: str | None, success: bool, source: str = "api",
+                 detail: str | None = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO login_events(ts, username, success, source, detail) VALUES(?,?,?,?,?)",
+            (now_iso(), username, 1 if success else 0, source, detail),
+        )
+
+
+def create_session(token_hash: str, user_id: int, expires_at: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO sessions(token_hash, user_id, created_at, expires_at, last_used) "
+            "VALUES(?,?,?,?,?)",
+            (token_hash, user_id, now_iso(), expires_at, now_iso()),
+        )
+
+
+def get_session(token_hash: str) -> dict | None:
+    with _connect() as conn:
+        r = conn.execute("SELECT * FROM sessions WHERE token_hash = ?", (token_hash,)).fetchone()
+        return dict(r) if r else None
+
+
+def touch_session(token_hash: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE sessions SET last_used = ? WHERE token_hash = ?",
+                     (now_iso(), token_hash))
+
+
+def revoke_session(token_hash: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE sessions SET revoked = 1 WHERE token_hash = ?", (token_hash,))
+
+
+def get_api_token(token_hash: str) -> dict | None:
+    with _connect() as conn:
+        r = conn.execute("SELECT * FROM api_tokens WHERE token_hash = ?", (token_hash,)).fetchone()
+        return dict(r) if r else None
 
 
 def register_backfill_version(dataset_name: str, version: str, nas_path: str, meta: dict) -> bool:

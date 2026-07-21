@@ -21,14 +21,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Gauge, generate_latest
 from pydantic import BaseModel, Field
 
 import db
 import broker as jobqueue
 import models_registry as reg
+import authn
 from auth import require_token
+
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
+MAX_FAILED_LOGINS = int(os.environ.get("MAX_FAILED_LOGINS", "10"))
 
 NAS_JOBS_ROOT = os.environ.get("NAS_JOBS_ROOT", "/mnt/vgreens_storage/ai/jobs")
 NAS_MOUNTPOINT = os.environ.get("NAS_MOUNTPOINT", "/mnt/vgreens_storage")
@@ -59,6 +63,7 @@ app = FastAPI(title="vGreens Job API", version=VERSION)
 @app.on_event("startup")
 def _startup() -> None:
     db.init_db()
+    authn.seed_admin_if_empty()
 
 
 # --------------------------------------------------------------------------- #
@@ -324,6 +329,70 @@ def rollback_model(model: str, body: RollbackBody, who: str = Depends(require_to
 @app.get("/audit")
 def read_audit(limit: int = 50, _: str = Depends(require_token)) -> list[dict]:
     return db.list_audit(limit=limit)
+
+
+# --------------------------------------------------------------------------- #
+# authentication (browser sessions). Static bearer tokens still work elsewhere.
+# --------------------------------------------------------------------------- #
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class ChangePasswordBody(BaseModel):
+    old_password: str
+    new_password: str
+
+
+@app.post("/auth/login")
+def auth_login(body: LoginBody, response: Response) -> dict:
+    user = db.get_user_by_username(body.username)
+    if user is None or not user["active"]:
+        db.record_login(body.username, False, "web", "unknown or disabled user")
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    if user["failed_logins"] >= MAX_FAILED_LOGINS:
+        db.record_login(body.username, False, "web", "locked")
+        raise HTTPException(status_code=429, detail="account temporarily locked — contact an admin")
+    if not authn.verify_password(body.password, user["password_hash"]):
+        db.note_login_result(user["id"], False)
+        db.record_login(body.username, False, "web", "bad password")
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    db.note_login_result(user["id"], True)
+    db.record_login(body.username, True, "web")
+    raw = authn.new_session(user["id"])
+    response.set_cookie(authn.SESSION_COOKIE, raw, httponly=True, samesite="lax",
+                        secure=COOKIE_SECURE, max_age=authn.SESSION_TTL_HOURS * 3600, path="/")
+    return db.user_public(user)
+
+
+@app.post("/auth/logout")
+def auth_logout(response: Response, vg_session: str = Cookie(default="")) -> dict:
+    if vg_session:
+        authn.revoke_session(vg_session)
+    response.delete_cookie(authn.SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/auth/me")
+def auth_me(ident: Optional[authn.Identity] = Depends(authn.current_identity)) -> dict:
+    if ident is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    return {"username": ident.username, "role": ident.role, "via": ident.via, "scopes": ident.scopes}
+
+
+@app.post("/auth/change-password")
+def auth_change_password(body: ChangePasswordBody,
+                         ident: Optional[authn.Identity] = Depends(authn.current_identity)) -> dict:
+    if ident is None or ident.via != "session" or ident.user_id is None:
+        raise HTTPException(status_code=401, detail="log in with a user account to change your password")
+    user = db.get_user_by_id(ident.user_id)
+    if user is None or not authn.verify_password(body.old_password, user["password_hash"]):
+        raise HTTPException(status_code=403, detail="current password is incorrect")
+    if len(body.new_password) < 8:
+        raise HTTPException(status_code=422, detail="new password must be at least 8 characters")
+    db.set_user_password(user["id"], authn.hash_password(body.new_password))
+    db.add_audit(ident.username, "auth.change_password", ident.username, source="web")
+    return {"ok": True}
 
 
 # --------------------------------------------------------------------------- #
