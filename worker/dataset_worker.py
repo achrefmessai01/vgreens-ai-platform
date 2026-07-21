@@ -144,6 +144,7 @@ def _handle(msg: dict) -> None:
         fails = [f["msg"] for f in report["findings"] if f["level"] == "fail"]
         _report(import_id, "rejected", error="audit failed: " + "; ".join(fails[:5]))
         print(f"[dataset-worker] {import_id} rejected by audit", flush=True)
+        shutil.rmtree(stage, ignore_errors=True)
         return
 
     # ---- licence gate ----

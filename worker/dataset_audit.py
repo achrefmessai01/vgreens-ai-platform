@@ -24,13 +24,17 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 DEFAULT_POLICY = {
     "corrupt_images": "fail",
-    "invalid_labels": "fail",     # malformed label lines
-    "invalid_boxes": "fail",      # out of [0,1] or non-positive size
+    "invalid_labels": "fail",     # malformed lines or class id out of range
+    "invalid_boxes": "fail",      # degenerate: zero/negative width or height
+    "oob_boxes": "warn",          # box extends past the frame edge (YOLO clips these)
     "split_leakage": "fail",      # same image in >1 split
     "missing_labels": "warn",
     "duplicate_images": "warn",
     "empty_labels": "allow",
 }
+
+# tolerance for coordinates just past [0,1] due to annotation rounding
+_BOX_EPS = 0.01
 
 
 def _read_yaml(root: Path) -> dict:
@@ -125,12 +129,20 @@ def audit(root: Path, policy: dict | None = None) -> dict:
                     x, y, w, hh = (float(v) for v in parts[1:5])
                 except ValueError:
                     n_bad += 1
-                    add("invalid_labels", f"{split}: unparNumeric line in {lbl.name}")
+                    add("invalid_labels", f"{split}: unparseable numeric line in {lbl.name}")
+                    continue
+                if ci < 0 or (nc and ci >= nc):
+                    n_bad += 1
+                    add("invalid_labels", f"{split}: class id {ci} out of range in {lbl.name}")
                     continue
                 class_instances[ci] = class_instances.get(ci, 0) + 1
-                if not (0 <= x <= 1 and 0 <= y <= 1) or w <= 0 or hh <= 0 or w > 1 or hh > 1:
+                if w <= 0 or hh <= 0:                     # degenerate -> fatal
                     n_badbox += 1
-                    add("invalid_boxes", f"{split}: box out of bounds in {lbl.name}")
+                    add("invalid_boxes", f"{split}: zero/negative-size box in {lbl.name}")
+                elif (x < -_BOX_EPS or x > 1 + _BOX_EPS or y < -_BOX_EPS or y > 1 + _BOX_EPS
+                      or w > 1 + _BOX_EPS or hh > 1 + _BOX_EPS):   # past the edge -> warn (clipped)
+                    n_badbox += 1
+                    add("oob_boxes", f"{split}: box extends past frame in {lbl.name}")
         hashes_by_split[split] = hashes
         report["splits"][split] = {
             "images": len(images), "missing_labels": n_missing, "empty_labels": n_empty,
