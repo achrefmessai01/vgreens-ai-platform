@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import secrets
 import subprocess
 from datetime import datetime, timezone
@@ -322,6 +323,140 @@ def rollback_model(model: str, body: RollbackBody, who: str = Depends(require_to
 @app.get("/audit")
 def read_audit(limit: int = 50, _: str = Depends(require_token)) -> list[dict]:
     return db.list_audit(limit=limit)
+
+
+# --------------------------------------------------------------------------- #
+# Dataset Factory — import workflows (executed by the CPU dataset worker) and
+# read-only views of frozen dataset versions. The API is the control plane:
+# it writes the import row and publishes to dataset_jobs; the worker consumes.
+# --------------------------------------------------------------------------- #
+DATASET_SOURCE_TYPES = {"roboflow", "local", "nas", "https", "s3"}
+_DATASET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,62}$")
+
+
+class DatasetImportRequest(BaseModel):
+    source_type: str
+    dataset_name: str
+    source: dict = Field(default_factory=dict)   # adapter-specific coords; NEVER secrets
+    requested_version: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+def _new_import_id() -> str:
+    return f"imp_{datetime.now(timezone.utc):%Y%m%d}_{secrets.token_hex(2)}"
+
+
+def _import_public(imp: dict) -> dict:
+    """DB row -> API shape: parse source_params JSON back to an object."""
+    out = dict(imp)
+    try:
+        out["source_params"] = json.loads(imp.get("source_params") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        out["source_params"] = {}
+    return out
+
+
+@app.post("/datasets/imports", status_code=201)
+def create_dataset_import(req: DatasetImportRequest, requested_by: str = Depends(require_token)) -> dict:
+    if req.source_type not in DATASET_SOURCE_TYPES:
+        raise HTTPException(status_code=422, detail=f"unsupported source_type: {req.source_type!r}")
+    if not _DATASET_NAME_RE.match(req.dataset_name):
+        raise HTTPException(status_code=422,
+                            detail="dataset_name must be lowercase [a-z0-9_], start alphanumeric, <=63 chars")
+
+    # idempotency: a repeated key returns the existing workflow, never a duplicate
+    if req.idempotency_key:
+        existing = db.get_import_by_idempotency(req.idempotency_key)
+        if existing:
+            return {"import_id": existing["import_id"], "state": existing["state"], "idempotent": True}
+
+    import_id = _new_import_id()
+    now = db.now_iso()
+    imp = {
+        "import_id": import_id,
+        "idempotency_key": req.idempotency_key,
+        "source_type": req.source_type,
+        "source_params": json.dumps(req.source or {}),
+        "dataset_name": req.dataset_name,
+        "requested_version": req.requested_version,
+        "resolved_version": None,
+        "state": "submitted",
+        "licence_name": None, "licence_status": None, "licence_by": None, "licence_at": None,
+        "requested_by": requested_by,
+        "error": None,
+        "created_at": now, "updated_at": now,
+    }
+    try:
+        db.create_dataset_import(imp)
+    except Exception:
+        # UNIQUE(idempotency_key) race: another request created it first
+        existing = db.get_import_by_idempotency(req.idempotency_key)
+        if existing:
+            return {"import_id": existing["import_id"], "state": existing["state"], "idempotent": True}
+        raise
+
+    try:
+        jobqueue.publish_dataset({
+            "import_id": import_id,
+            "source_type": req.source_type,
+            "source_params": req.source or {},
+            "dataset_name": req.dataset_name,
+            "requested_version": req.requested_version,
+        })
+    except Exception as exc:
+        db.update_dataset_import(import_id, "failed", error=f"publish failed: {exc}")
+        raise HTTPException(status_code=503, detail=f"queue unavailable: {exc}")
+
+    db.add_audit(requested_by, "dataset.import.submit", req.dataset_name, source="api")
+    return {"import_id": import_id, "state": "submitted"}
+
+
+@app.get("/datasets/imports")
+def list_dataset_imports(response: Response, state: Optional[str] = None,
+                         dataset_name: Optional[str] = None, limit: int = 50, offset: int = 0,
+                         _: str = Depends(require_token)) -> list[dict]:
+    response.headers["X-Total-Count"] = str(db.count_dataset_imports(state, dataset_name))
+    return [_import_public(r) for r in db.list_dataset_imports(state, dataset_name, limit, offset)]
+
+
+@app.get("/datasets/imports/{import_id}")
+def get_dataset_import(import_id: str, _: str = Depends(require_token)) -> dict:
+    imp = db.get_dataset_import(import_id)
+    if imp is None:
+        raise HTTPException(status_code=404, detail="import not found")
+    out = _import_public(imp)
+    out["events"] = db.list_dataset_import_events(import_id)
+    return out
+
+
+@app.post("/datasets/imports/{import_id}/cancel")
+def cancel_dataset_import(import_id: str, who: str = Depends(require_token)) -> dict:
+    imp = db.get_dataset_import(import_id)
+    if imp is None:
+        raise HTTPException(status_code=404, detail="import not found")
+    if imp["state"] in db.DATASET_TERMINAL:
+        raise HTTPException(status_code=409, detail=f"import already {imp['state']}")
+    db.update_dataset_import(import_id, "cancelled", detail="cancelled via API")
+    db.add_audit(who, "dataset.import.cancel", import_id, source="api")
+    return {"import_id": import_id, "state": "cancelled"}
+
+
+@app.get("/datasets")
+def list_datasets(_: str = Depends(require_token)) -> dict:
+    return {"datasets": db.list_datasets()}
+
+
+@app.get("/datasets/{dataset_name}/versions")
+def list_dataset_versions(dataset_name: str, _: str = Depends(require_token)) -> list[dict]:
+    return db.list_dataset_versions(dataset_name)
+
+
+@app.get("/datasets/{dataset_name}/versions/{version}")
+def get_dataset_version(dataset_name: str, version: str, _: str = Depends(require_token)) -> dict:
+    v = db.get_dataset_version(dataset_name, version)
+    if v is None:
+        raise HTTPException(status_code=404, detail="version not found")
+    return v
 
 
 @app.get("/metrics")

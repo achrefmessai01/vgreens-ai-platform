@@ -408,3 +408,152 @@ def list_audit(limit: int = 50) -> list[dict]:
             (int(limit),),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Dataset Factory: import workflows + frozen-version index
+# --------------------------------------------------------------------------- #
+DATASET_TERMINAL = ("frozen", "rejected", "failed", "cancelled")
+
+_IMPORT_COLS = (
+    "import_id", "idempotency_key", "source_type", "source_params", "dataset_name",
+    "requested_version", "resolved_version", "state", "licence_name", "licence_status",
+    "licence_by", "licence_at", "requested_by", "error", "created_at", "updated_at",
+)
+
+
+def create_dataset_import(imp: dict) -> None:
+    """Insert a new import workflow and log its first state event.
+
+    Raises sqlite3.IntegrityError if the idempotency_key already exists."""
+    placeholders = ",".join("?" for _ in _IMPORT_COLS)
+    with _connect() as conn:
+        conn.execute(
+            f"INSERT INTO dataset_imports ({','.join(_IMPORT_COLS)}) VALUES ({placeholders})",
+            [imp.get(c) for c in _IMPORT_COLS],
+        )
+        conn.execute(
+            "INSERT INTO dataset_import_events(import_id, ts, state, detail) VALUES(?,?,?,?)",
+            (imp["import_id"], now_iso(), imp["state"], None),
+        )
+
+
+def get_dataset_import(import_id: str) -> dict | None:
+    with _connect() as conn:
+        r = conn.execute(
+            "SELECT * FROM dataset_imports WHERE import_id = ?", (import_id,)
+        ).fetchone()
+        return dict(r) if r else None
+
+
+def get_import_by_idempotency(key: str | None) -> dict | None:
+    if not key:
+        return None
+    with _connect() as conn:
+        r = conn.execute(
+            "SELECT * FROM dataset_imports WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        return dict(r) if r else None
+
+
+def _import_filters(state=None, dataset_name=None):
+    clauses, params = [], []
+    for col, val in (("state", state), ("dataset_name", dataset_name)):
+        if val:
+            clauses.append(f"{col} = ?")
+            params.append(val)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    return where, params
+
+
+def list_dataset_imports(state=None, dataset_name=None, limit: int = 50, offset: int = 0) -> list[dict]:
+    where, params = _import_filters(state, dataset_name)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM dataset_imports {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            params + [int(limit), int(offset)],
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_dataset_imports(state=None, dataset_name=None) -> int:
+    where, params = _import_filters(state, dataset_name)
+    with _connect() as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM dataset_imports {where}", params).fetchone()[0]
+
+
+def add_dataset_import_event(import_id: str, state: str, detail: str | None = None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO dataset_import_events(import_id, ts, state, detail) VALUES(?,?,?,?)",
+            (import_id, now_iso(), state, detail),
+        )
+
+
+def list_dataset_import_events(import_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT ts, state, detail FROM dataset_import_events WHERE import_id = ? ORDER BY id",
+            (import_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_dataset_import(import_id: str, state: str, **fields) -> bool:
+    """Update an import's state (+ optional fields) and log a transition event.
+
+    Terminal states are never overridden (a cancelled/failed import stays put)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT state FROM dataset_imports WHERE import_id = ?", (import_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        prev = row["state"]
+        if prev in DATASET_TERMINAL and state != prev:
+            return False
+
+        sets = {"state": state, "updated_at": now_iso()}
+        for k in ("resolved_version", "licence_name", "licence_status",
+                  "licence_by", "licence_at", "error"):
+            if fields.get(k) is not None:
+                sets[k] = fields[k]
+        assignments = ",".join(f"{k} = ?" for k in sets)
+        cur = conn.execute(
+            f"UPDATE dataset_imports SET {assignments} WHERE import_id = ?",
+            list(sets.values()) + [import_id],
+        )
+        if cur.rowcount > 0 and state != prev:
+            conn.execute(
+                "INSERT INTO dataset_import_events(import_id, ts, state, detail) VALUES(?,?,?,?)",
+                (import_id, now_iso(), state, fields.get("error") or fields.get("detail")),
+            )
+        return cur.rowcount > 0
+
+
+# ---- frozen-version index (registration happens at freeze time, 5B.4) ----
+def list_datasets() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT dataset_name, COUNT(*) AS versions, MAX(frozen_at) AS latest_frozen_at "
+            "FROM dataset_versions GROUP BY dataset_name ORDER BY dataset_name"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_dataset_versions(dataset_name: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM dataset_versions WHERE dataset_name = ? ORDER BY frozen_at DESC",
+            (dataset_name,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_dataset_version(dataset_name: str, version: str) -> dict | None:
+    with _connect() as conn:
+        r = conn.execute(
+            "SELECT * FROM dataset_versions WHERE dataset_name = ? AND version = ?",
+            (dataset_name, version),
+        ).fetchone()
+        return dict(r) if r else None

@@ -23,6 +23,7 @@ import pika
 TRAINING_QUEUE = "training_jobs"
 PROCESSING_QUEUE = "processing_jobs"
 FAILED_QUEUE = "failed_jobs"
+DATASET_QUEUE = "dataset_jobs"      # CPU-only Dataset Factory (no GPU worker)
 
 QUEUE_FOR_TYPE = {
     "training": TRAINING_QUEUE,
@@ -51,6 +52,7 @@ def _declare(channel) -> None:
     channel.queue_declare(queue=TRAINING_QUEUE, durable=True)
     channel.queue_declare(queue=PROCESSING_QUEUE, durable=True)
     channel.queue_declare(queue=FAILED_QUEUE, durable=True)
+    channel.queue_declare(queue=DATASET_QUEUE, durable=True)
 
 
 def publish(job: dict) -> None:
@@ -71,6 +73,27 @@ def publish(job: dict) -> None:
                 delivery_mode=2,               # persistent
                 content_type="application/json",
             ),
+        )
+    finally:
+        conn.close()
+
+
+def publish_dataset(msg: dict) -> None:
+    """Publish a dataset-import message to the CPU-only dataset_jobs queue.
+
+    `msg` must NOT contain secrets (API keys, signed URLs) — only source
+    coordinates (workspace/project/path) the dataset worker resolves with its
+    own server-side credentials.
+    """
+    conn = pika.BlockingConnection(_params())
+    try:
+        channel = conn.channel()
+        _declare(channel)
+        channel.basic_publish(
+            exchange="",
+            routing_key=DATASET_QUEUE,
+            body=json.dumps(msg).encode("utf-8"),
+            properties=pika.BasicProperties(delivery_mode=2, content_type="application/json"),
         )
     finally:
         conn.close()
