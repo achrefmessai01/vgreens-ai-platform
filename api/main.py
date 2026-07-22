@@ -37,6 +37,9 @@ MAX_FAILED_LOGINS = int(os.environ.get("MAX_FAILED_LOGINS", "10"))
 NAS_JOBS_ROOT = os.environ.get("NAS_JOBS_ROOT", "/mnt/vgreens_storage/ai/jobs")
 NAS_MOUNTPOINT = os.environ.get("NAS_MOUNTPOINT", "/mnt/vgreens_storage")
 NAS_DATASETS_ROOT = os.environ.get("NAS_DATASETS", "/mnt/vgreens_storage/ai/datasets")
+NAS_JOB_CONFIGS_ROOT = os.environ.get("NAS_JOB_CONFIGS", "/mnt/vgreens_storage/ai/job-configs")
+
+_CONFIG_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,62}$")
 
 VERSION = "0.2.0"        # API version (bumped for Phase 3 additive endpoints)
 API_LEVEL = "v1"         # wire-compat level; bump only on breaking changes
@@ -337,6 +340,44 @@ def rollback_model(model: str, body: RollbackBody, who: str = Depends(authn.acto
     db.add_audit(who, "model.rollback", f"{model}:{res.get('active_version')}",
                  reason=body.reason, source="api")
     return res
+
+
+class ConfigPublish(BaseModel):
+    content: str = Field(..., description="the job-config YAML text")
+
+
+@app.post("/model-configs/{model}")
+def publish_model_config(model: str, body: ConfigPublish,
+                         who: str = Depends(authn.actor("operator"))) -> dict:
+    """Publish a model's job-config to the shared NAS config store.
+
+    Replaces the manual `cp configs/x.yaml /mnt/.../job-configs/` on the GPU box.
+    The path is derived from the (validated) model name, so a caller cannot write
+    outside the config directory.
+    """
+    if not _CONFIG_NAME_RE.match(model):
+        raise HTTPException(status_code=400, detail="invalid model name")
+    try:
+        import yaml
+        if not isinstance(yaml.safe_load(body.content), dict):
+            raise HTTPException(status_code=400, detail="config must be a YAML mapping")
+    except HTTPException:
+        raise
+    except ModuleNotFoundError:
+        pass  # yaml not in the API venv — skip strict validation, still write
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"invalid YAML: {exc}")
+    try:
+        root = Path(NAS_JOB_CONFIGS_ROOT)
+        root.mkdir(parents=True, exist_ok=True)
+        target = root / f"{model}.yaml"
+        tmp = target.with_suffix(".yaml.tmp")
+        tmp.write_text(body.content)
+        os.replace(tmp, target)   # atomic publish
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=f"NAS unavailable: {exc}")
+    db.add_audit(who, "config.publish", model, source="api")
+    return {"model": model, "path": str(target)}
 
 
 @app.get("/audit")

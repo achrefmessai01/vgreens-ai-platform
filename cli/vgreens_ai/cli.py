@@ -333,12 +333,63 @@ def model_presets(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
                 title="model presets")
 
 
+def _create_gitlab_repo(spec: dict, out_dir: str) -> None:
+    """Create the GitLab project in the spec's group and push the skeleton.
+
+    Uses GITLAB_TOKEN (a PAT with 'api' scope) from the environment; the token is
+    never printed or persisted in the git remote.
+    """
+    import json
+    import os
+    import subprocess
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    token = os.environ.get("GITLAB_TOKEN")
+    if not token:
+        raise CLIError("set GITLAB_TOKEN (GitLab PAT with 'api' scope) to use --create-repo", 2)
+    host = os.environ.get("GITLAB_HOST", "https://gitlab.com").rstrip("/")
+    ns = spec.get("repository", {}).get("namespace", "vgreens-models")
+    name = spec.get("repository", {}).get("name") or spec["model"]["name"]
+
+    def _api(method: str, path: str, data: dict | None = None) -> dict:
+        body = urllib.parse.urlencode(data).encode() if data else None
+        req = urllib.request.Request(f"{host}/api/v4{path}", data=body, method=method,
+                                     headers={"PRIVATE-TOKEN": token})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as exc:
+            raise CLIError(f"GitLab API {method} {path} failed: {exc.code} {exc.reason}", 1)
+
+    grp = _api("GET", f"/groups/{urllib.parse.quote_plus(ns)}")
+    proj = _api("POST", "/projects",
+                {"name": name, "namespace_id": grp["id"], "visibility": "private"})
+    clean_url = proj["http_url_to_repo"]
+    output.success(f"created GitLab project {proj['path_with_namespace']}")
+
+    def _git(*args: str) -> None:
+        subprocess.run(["git", "-C", out_dir, *args], check=True)
+
+    _git("init", "-q", "-b", "main")
+    _git("add", "-A")
+    _git("-c", "user.email=cli@vgreens", "-c", "user.name=vgreens-ai",
+         "commit", "-q", "-m", "chore: scaffold model repo")
+    _git("remote", "add", "origin", clean_url)                       # clean URL persisted
+    push_url = clean_url.replace("https://", f"https://oauth2:{token}@")
+    subprocess.run(["git", "-C", out_dir, "push", "-u", push_url, "main"], check=True)
+    output.success(f"pushed to {proj['web_url']} — pipeline starts on the group runner")
+
+
 @model_app.command("onboard")
 def model_onboard(ctx: typer.Context,
                   spec_path: str = typer.Option(..., "--spec", help="path to model.yaml"),
                   output_dir: str = typer.Option(None, "--output-dir", help="target dir (default: repo name)"),
                   dry_run: bool = typer.Option(False, "--dry-run", help="show files, write nothing"),
-                  force: bool = typer.Option(False, "--force", help="overwrite a non-empty dir")):
+                  force: bool = typer.Option(False, "--force", help="overwrite a non-empty dir"),
+                  create_repo: bool = typer.Option(False, "--create-repo",
+                                                   help="create the GitLab project in the group and push (needs GITLAB_TOKEN)")):
     """Generate a model repository from a model.yaml spec."""
     try:
         spec = modelspec.load_spec(spec_path)
@@ -364,11 +415,16 @@ def model_onboard(ctx: typer.Context,
     output.info(f"{verb} {len(files)} file(s) in [bold]{out}/[/]:")
     for f in files:
         output.err.print(f"  {f}")
-    if not dry_run:
-        output.success(f"model repo ready at {out}/")
-        output.info("next: cd in, run `pytest tests/`, then git init / commit / push to GitLab")
-        if modelspec.threshold_state(spec) != "configured":
-            output.warn("thresholds not configured — trained versions will be 'baseline_only'")
+    if dry_run:
+        return
+    output.success(f"model repo ready at {out}/")
+    if modelspec.threshold_state(spec) != "configured":
+        output.warn("thresholds not configured — trained versions will be 'baseline_only'")
+    if create_repo:
+        _create_gitlab_repo(spec, out)
+    else:
+        output.info("next: cd in, run `pytest tests/`, then git push "
+                    "(or re-run with --create-repo to create + push automatically)")
 
 
 @model_app.command("validate-spec")
@@ -390,6 +446,63 @@ def model_validate_spec(ctx: typer.Context, path: str = typer.Argument(..., help
     if state != "configured":
         output.warn("validation thresholds not configured — a trained version will be "
                     "'baseline_only' and cannot be promoted until thresholds are set")
+
+
+@model_app.command("init")
+def model_init(ctx: typer.Context,
+               path: str = typer.Option("model.yaml", "--out", help="where to write the spec")):
+    """Interactively scaffold a valid model.yaml (no hand-editing YAML)."""
+    import yaml as _yaml
+    from pathlib import Path as _Path
+
+    output.info("Scaffolding model.yaml — press Ctrl-C to abort.")
+    name = typer.prompt("model name (lowercase_underscore)")
+    task = typer.prompt(f"task {modelspec.TASKS}", default="object_detection")
+    preset_by_task = {v["task"]: k for k, v in modelspec.PRESETS.items()}
+    preset = typer.prompt(f"preset {tuple(modelspec.PRESETS)}",
+                          default=preset_by_task.get(task, "custom_python"))
+    ds_name = typer.prompt("dataset name")
+    ds_ver = typer.prompt("dataset version", default="v1")
+    gpu = typer.prompt("gpu_count (1 or 2)", default=1, type=int)
+    metric = typer.prompt("primary metric name (e.g. mAP50, accuracy)", default="mAP50")
+    bar = typer.prompt(f"minimum {metric} for promotion (blank = none yet)",
+                       default="", show_default=False)
+    ns = typer.prompt("GitLab group/namespace", default="vgreens-models")
+    repo = typer.prompt("repository name", default=f"vgreens-model-{name.replace('_', '-')}")
+
+    spec = {
+        "schema_version": modelspec.SCHEMA_VERSION,
+        "model": {"name": name, "task": task, "owner": ""},
+        "template": {"preset": preset},
+        "dataset": {"name": ds_name, "version": ds_ver},
+        "training": {"epochs": 50, "image_size": 640, "batch_size": 16, "gpu_count": int(gpu)},
+        "validation": {"thresholds": ({metric: float(bar)} if str(bar).strip() else {})},
+        "processing": {"confidence_threshold": 0.25},
+        "repository": {"namespace": ns, "name": repo},
+    }
+    errors = modelspec.validate(spec)
+    if errors:
+        for e in errors:
+            output.error(e)
+        raise CLIError("could not build a valid spec from those answers", 2)
+    _Path(path).write_text(_yaml.safe_dump(spec, sort_keys=False))
+    output.success(f"wrote {path}")
+    output.info(f"next: vgreens-ai model onboard --spec {path} --create-repo")
+
+
+@config_app.command("publish")
+def config_publish(ctx: typer.Context,
+                   model: str = typer.Argument(..., help="model name"),
+                   file: str = typer.Option(..., "--file", "-f", help="path to the job-config yaml"),
+                   out: Optional[str] = OUTPUT_OPT):
+    """Publish a model's job-config to the platform (no SSH/cp on the GPU box)."""
+    _mode(ctx, out)
+    try:
+        content = open(file).read()
+    except OSError as exc:
+        raise CLIError(f"cannot read {file}: {exc}", 2)
+    res = _client(ctx).post(f"/model-configs/{model}", json={"content": content})
+    output.success(f"published {model} config -> {res.get('path')}")
 
 
 # --------------------------------------------------------------------------- #

@@ -5,8 +5,9 @@ The runnable code (entrypoint/train/process/Dockerfile) is generic across
 Ultralytics detection models — the same contract-compliant code proven by
 vgreens-model-strawberry-disease. Only config/CI/README are templated per spec.
 
-custom_python emits a skeleton whose contract test FAILS until the engineer
-implements train()/process() — never placeholder code that silently succeeds.
+custom_python emits a RUNNABLE reference (train.py/process.py train a trivial
+baseline and honour the contract) so the pipeline is green from commit 1; the
+engineer replaces the marked sections with their real model.
 """
 from __future__ import annotations
 
@@ -170,55 +171,120 @@ def test_scripts_compile():
 '''
 
 _CUSTOM_TRAIN = '''\
-"""Custom training. IMPLEMENT THIS: read /data + /config/job.yaml, train, and write
-/out/model.pt + /out/eval/metrics.json. Must exit 0 on success."""
+"""Custom training — RUNNABLE REFERENCE (edit the marked sections).
+
+Honours the platform contract: reads /data (ro) + /config/job.yaml (ro), writes
+/out/model.pt and /out/eval/metrics.json, exits 0. As shipped it trains a trivial
+baseline so the pipeline is GREEN from commit 1 — replace the marked block with
+your real model + training loop (any framework).
+"""
+import json
+import pickle
 import sys
+from pathlib import Path
+
+import yaml
+
+OUT = Path("/out")
+DATA = Path("/data")
+CONFIG = Path("/config/job.yaml")
 
 
 def main() -> int:
-    raise NotImplementedError("implement training for this custom model")
+    (OUT / "eval").mkdir(parents=True, exist_ok=True)
+    cfg = (yaml.safe_load(CONFIG.read_text()) if CONFIG.is_file() else {}) or {}
+    epochs = int(cfg.get("train", {}).get("epochs", 5))
+    samples = sorted(p for p in DATA.rglob("*") if p.is_file())
+    print(f"[train] epochs={epochs} samples={len(samples)}", flush=True)
+
+    # ===== REPLACE: build + train your model on the data in /data =====
+    model = {"kind": "baseline", "n_samples": len(samples), "epochs": epochs}
+    accuracy = 1.0 if samples else 0.0   # placeholder metric — compute a real one
+    # ==================================================================
+
+    with open(OUT / "model.pt", "wb") as fh:        # required artifact
+        pickle.dump(model, fh)
+    # metric keys here must include whatever you set under `thresholds` in the config
+    (OUT / "eval" / "metrics.json").write_text(
+        json.dumps({"accuracy": round(float(accuracy), 4)}, indent=2))
+    print(f"[train] wrote model.pt + metrics.json (accuracy={accuracy})", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
 '''
 
-_CUSTOM_CONTRACT = '''\
-"""Contract test — FAILS until train()/process() are implemented."""
-import importlib.util
+_CUSTOM_PROCESS = '''\
+"""Custom processing/inference — RUNNABLE REFERENCE (edit the marked section).
+
+Loads the promoted model at /model/model.pt, runs over /data, writes
+/out/report.json, exits 0. Replace the marked block with your real inference.
+"""
+import json
+import os
+import pickle
+import sys
 from pathlib import Path
 
-import pytest
-
-ROOT = Path(__file__).resolve().parent.parent
-
-
-def _run(script):
-    spec = importlib.util.spec_from_file_location(script, ROOT / script)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.main
+OUT = Path("/out")
+DATA = Path("/data")
+MODEL = Path("/model/model.pt")
 
 
-@pytest.mark.parametrize("script", ["train.py", "process.py"])
-def test_not_placeholder(script):
-    # A generated custom model must be implemented before it can pass CI.
-    with pytest.raises(NotImplementedError):
-        _run(script)()
-    pytest.fail(f"{script} still raises NotImplementedError — implement it")
+def main() -> int:
+    OUT.mkdir(parents=True, exist_ok=True)
+    if not MODEL.is_file():
+        sys.stderr.write("no model at /model/model.pt — is a version promoted?\\n")
+        return 1
+    with open(MODEL, "rb") as fh:
+        model = pickle.load(fh)
+    inputs = sorted(p for p in DATA.rglob("*") if p.is_file())
+
+    # ===== REPLACE: run real inference with `model` over `inputs` =====
+    results = len(inputs)
+    # =================================================================
+
+    report = {"model": os.environ.get("MODEL_NAME", ""),
+              "model_version": os.environ.get("MODEL_VERSION", ""),
+              "inputs": len(inputs), "results": results}
+    (OUT / "report.json").write_text(json.dumps(report, indent=2))
+    print(f"[process] done: {report}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 '''
 
 _GITIGNORE = "__pycache__/\n*.pyc\n.pytest_cache/\nruns/\nout/\n*.pt\n.DS_Store\n"
 
 
 def _dockerfile(base_model: str) -> str:
+    # opencv-python-headless (not opencv-python) has no libGL/X11 system deps, so
+    # we don't need `apt-get install libgl1 libglib2.0-0` — which means the build
+    # never depends on the Ubuntu package mirror being reachable.
     return f"""\
 # {base_model} detection image (ultralytics). PyTorch CUDA base proven on this host.
 FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \\
-        libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir "ultralytics==8.3.0" pyyaml
+RUN pip install --no-cache-dir "ultralytics==8.3.0" pyyaml \\
+ && pip uninstall -y opencv-python opencv-python-headless >/dev/null 2>&1 || true \\
+ && pip install --no-cache-dir "opencv-python-headless<4.12"
 RUN python -c "from ultralytics import YOLO; YOLO('{base_model}')"
+WORKDIR /app
+COPY train.py process.py entrypoint.py /app/
+ENTRYPOINT ["python", "/app/entrypoint.py"]
+"""
+
+
+def _dockerfile_custom() -> str:
+    # Lightweight base for the pure-Python custom reference. No CUDA/apt, so no
+    # mirror dependency. Swap the base + pip installs for your framework
+    # (torch, tensorflow, scikit-learn, ...) when you implement a real model.
+    return """\
+# Lightweight custom-model image. The runnable reference needs only PyYAML.
+FROM python:3.11-slim
+RUN pip install --no-cache-dir pyyaml
 WORKDIR /app
 COPY train.py process.py entrypoint.py /app/
 ENTRYPOINT ["python", "/app/entrypoint.py"]
@@ -270,17 +336,22 @@ Generated by `vgreens-ai model onboard`.
 
 Dataset: `{ds['name']}:{ds.get('version', 'v1')}` (frozen in the registry).
 
-## Local build + run (on the GPU server)
+## Deploy this model
 
+1. Publish the job-config to the platform (no SSH to the GPU box):
+   ```bash
+   vgreens-ai config publish {m['name']} --file configs/{m['name']}.yaml
+   ```
+2. Push this repo. CI (on the self-hosted runner) runs: lint → test →
+   build+scan+push image → manual training submission through the Job API.
+
+Or drive it entirely from the CLI once the image is built:
 ```bash
-docker build -t vgreens/{m['name']}:v1 .
-sudo cp configs/{m['name']}.yaml /mnt/vgreens_storage/ai/job-configs/
 vgreens-ai job train --model {m['name']} --dataset {ds['name']}:{ds.get('version', 'v1')} \\
-  --image vgreens/{m['name']}:v1 --config /mnt/vgreens_storage/ai/job-configs/{m['name']}.yaml
+  --image $CI_REGISTRY_IMAGE:latest --config /mnt/vgreens_storage/ai/job-configs/{m['name']}.yaml
+vgreens-ai model show {m['name']}
+vgreens-ai model promote {m['name']} <version>
 ```
-
-CI (once a GitLab Runner is registered): push → lint → test → build+scan+push image →
-manual training submission through the Job API.
 """
 
 
@@ -306,12 +377,12 @@ def _render_custom(spec: dict) -> dict:
     return {
         "entrypoint.py": _ENTRYPOINT_PY,
         "train.py": _CUSTOM_TRAIN,
-        "process.py": _CUSTOM_TRAIN.replace("training", "processing"),
-        "Dockerfile": _dockerfile("yolo11n.pt"),
+        "process.py": _CUSTOM_PROCESS,
+        "Dockerfile": _dockerfile_custom(),
         f"configs/{m}.yaml": _config_yaml(spec),
         ".gitlab-ci.yml": _gitlab_ci(spec),
-        "tests/test_contract.py": _CUSTOM_CONTRACT,
-        "README.md": _readme(spec, "custom_python") + "\n> TODO: implement train.py and process.py.\n",
+        "tests/test_contract.py": _CONTRACT_TEST,
+        "README.md": _readme(spec, "custom_python"),
         ".gitignore": _GITIGNORE,
     }
 

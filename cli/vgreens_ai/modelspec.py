@@ -18,7 +18,7 @@ PRESETS: dict[str, dict] = {
     "ultralytics_detection": {"task": "object_detection", "generates_working_code": True},
     "ultralytics_classification": {"task": "classification", "generates_working_code": True},
     "ultralytics_segmentation": {"task": "segmentation", "generates_working_code": True},
-    "custom_python": {"task": "custom", "generates_working_code": False},
+    "custom_python": {"task": "custom", "generates_working_code": True},
 }
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,62}$")
