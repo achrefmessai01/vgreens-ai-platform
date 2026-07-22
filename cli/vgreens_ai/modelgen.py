@@ -244,7 +244,7 @@ def _config_yaml(spec: dict) -> str:
 def _gitlab_ci(spec: dict) -> str:
     m = spec["model"]["name"]
     ds = spec["dataset"]
-    ns = spec.get("repository", {}).get("namespace", "achrefmessai")
+    ns = spec.get("repository", {}).get("namespace", "vgreens-models")
     return f"""\
 include:
   - project: '{ns}/vgreens-model-template'
