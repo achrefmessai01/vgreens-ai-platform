@@ -28,6 +28,7 @@ gpu_app = typer.Typer(no_args_is_help=True, help="GPUs.")
 system_app = typer.Typer(no_args_is_help=True, help="Platform health and diagnostics.")
 config_app = typer.Typer(no_args_is_help=True, help="CLI configuration and profiles.")
 dataset_app = typer.Typer(no_args_is_help=True, help="Datasets (where the server supports it).")
+admin_app = typer.Typer(no_args_is_help=True, help="Administration: users, tokens, audit (admin only).")
 app.add_typer(job_app, name="job")
 app.add_typer(model_app, name="model")
 app.add_typer(worker_app, name="worker")
@@ -35,6 +36,7 @@ app.add_typer(gpu_app, name="gpu")
 app.add_typer(system_app, name="system")
 app.add_typer(config_app, name="config")
 app.add_typer(dataset_app, name="dataset")
+app.add_typer(admin_app, name="admin")
 
 
 @dataclass
@@ -943,6 +945,175 @@ def _status(ctx: typer.Context, job_id: str = typer.Option(..., "--job-id")):
 def _list_jobs(ctx: typer.Context, status: str = typer.Option(None), model: str = typer.Option(None),
                limit: int = typer.Option(20)):
     _job_list(ctx, status, None, model, limit)
+
+
+# ---------------------------------------------------------------------------
+# admin: users / tokens / audit  (server enforces the admin role + all guards)
+# ---------------------------------------------------------------------------
+_CONFLICT_HINT = {
+    "USER_HAS_ACTIVE_SESSIONS": "force logout first: vgreens-ai admin force-logout <id>",
+    "USER_HAS_ACTIVE_TOKENS": "revoke their tokens first (vgreens-ai admin tokens)",
+    "USER_HAS_ACTIVE_JOBS": "wait for or cancel their queued/running jobs first",
+    "USER_IS_FINAL_ADMIN": "the platform must always keep one active admin",
+}
+
+
+def _admin_run(fn):
+    """Call an admin endpoint and turn conflict codes into a readable hint."""
+    try:
+        return fn()
+    except CLIError as exc:
+        hint = _CONFLICT_HINT.get(str(exc).strip())
+        if hint:
+            raise CLIError(f"{exc} — {hint}", exc.code) from None
+        raise
+
+
+@admin_app.command("users")
+def admin_users(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
+    """List all users."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    rows = _client(ctx).get("/admin/users")
+    output.emit(rows, g.output, columns=[
+        ("id", "id"), ("username", "username"), ("role", "role"),
+        ("active", "active"), ("last login", "last_login"),
+    ], title="users")
+
+
+@admin_app.command("user")
+def admin_user(ctx: typer.Context, user_id: int = typer.Argument(...), out: Optional[str] = OUTPUT_OPT):
+    """Show one user with active session / token / job counts."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    output.emit(_client(ctx).get(f"/admin/users/{user_id}"), g.output)
+
+
+@admin_app.command("create-user")
+def admin_create_user(ctx: typer.Context,
+                      username: str = typer.Option(..., "--username", "-u"),
+                      role: str = typer.Option("viewer", "--role", help="viewer | operator | admin"),
+                      password: Optional[str] = typer.Option(None, "--password",
+                          help="prompted (hidden) if omitted")):
+    """Create a user."""
+    g: G = ctx.obj
+    if not password:
+        password = typer.prompt("Password (min 8 chars)", hide_input=True, confirmation_prompt=True)
+    res = _client(ctx).post("/admin/users", json={"username": username, "password": password, "role": role},
+                            spinner="creating user…")
+    if g.output == "table":
+        output.success(f"created user '{username}' ({role})")
+    else:
+        output.emit(res, g.output)
+
+
+@admin_app.command("set-role")
+def admin_set_role(ctx: typer.Context, user_id: int = typer.Argument(...),
+                   role: str = typer.Argument(..., help="viewer | operator | admin")):
+    """Change a user's role."""
+    _admin_run(lambda: _client(ctx).request("PATCH", f"/admin/users/{user_id}",
+                                            json={"role": role}, spinner="updating…"))
+    output.success(f"user {user_id} → {role}")
+
+
+@admin_app.command("disable")
+def admin_disable(ctx: typer.Context, user_id: int = typer.Argument(...)):
+    """Disable a user and revoke their sessions."""
+    _admin_run(lambda: _client(ctx).post(f"/admin/users/{user_id}/disable", spinner="disabling…"))
+    output.success(f"user {user_id} disabled")
+
+
+@admin_app.command("enable")
+def admin_enable(ctx: typer.Context, user_id: int = typer.Argument(...)):
+    """Re-enable a disabled user."""
+    _client(ctx).post(f"/admin/users/{user_id}/enable", spinner="enabling…")
+    output.success(f"user {user_id} enabled")
+
+
+@admin_app.command("force-logout")
+def admin_force_logout(ctx: typer.Context, user_id: int = typer.Argument(...)):
+    """Revoke all of a user's active sessions."""
+    res = _client(ctx).post(f"/admin/users/{user_id}/force-logout", spinner="revoking sessions…")
+    n = (res or {}).get("sessions_revoked", 0)
+    output.success(f"user {user_id}: {n} session(s) revoked")
+
+
+@admin_app.command("reset-password")
+def admin_reset_password(ctx: typer.Context, user_id: int = typer.Argument(...),
+                         password: Optional[str] = typer.Option(None, "--password")):
+    """Set a new password for a user."""
+    if not password:
+        password = typer.prompt("New password (min 8 chars)", hide_input=True, confirmation_prompt=True)
+    _client(ctx).post(f"/admin/users/{user_id}/reset-password", json={"password": password},
+                      spinner="resetting…")
+    output.success(f"password reset for user {user_id}")
+
+
+@admin_app.command("anonymise")
+def admin_anonymise(ctx: typer.Context, user_id: int = typer.Argument(...),
+                    yes: bool = typer.Option(False, "--yes", help="skip confirmation")):
+    """Anonymise a user: rename to deleted_user_<id>, revoke sessions+tokens, keep audit history."""
+    if not yes:
+        typer.confirm(f"Anonymise user {user_id}? This renames the account and revokes access. "
+                      "It cannot be undone.", abort=True)
+    res = _admin_run(lambda: _client(ctx).post(f"/admin/users/{user_id}/anonymise", spinner="anonymising…"))
+    output.success(f"user {user_id} anonymised → {(res or {}).get('username', 'deleted_user')}")
+
+
+@admin_app.command("delete")
+def admin_delete(ctx: typer.Context, user_id: int = typer.Argument(...),
+                 yes: bool = typer.Option(False, "--yes", help="skip confirmation")):
+    """Permanently delete a user (only if they have no active sessions, tokens, or jobs)."""
+    if not yes:
+        typer.confirm(f"Permanently delete user {user_id}? Consider `anonymise` to keep audit history.",
+                      abort=True)
+    _admin_run(lambda: _client(ctx).request("DELETE", f"/admin/users/{user_id}", spinner="deleting…"))
+    output.success(f"user {user_id} deleted")
+
+
+@admin_app.command("tokens")
+def admin_tokens(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
+    """List API tokens."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    rows = _client(ctx).get("/admin/tokens")
+    output.emit(rows, g.output, columns=[
+        ("id", "id"), ("name", "name"), ("owner", "owner"),
+        ("scopes", "scopes"), ("created", "created_at"), ("revoked", "revoked"),
+    ], title="api tokens")
+
+
+@admin_app.command("create-token")
+def admin_create_token(ctx: typer.Context,
+                       name: str = typer.Option(..., "--name"),
+                       scopes: str = typer.Option("jobs:read jobs:submit", "--scopes",
+                           help="space-separated scopes")):
+    """Create an API token (the secret is shown once)."""
+    res = _client(ctx).post("/admin/tokens", json={"name": name, "scopes": scopes},
+                            spinner="creating token…")
+    token = (res or {}).get("token")
+    output.success("token created — copy it now, it is shown only once:")
+    output.info(token or "(no token returned)")
+
+
+@admin_app.command("revoke-token")
+def admin_revoke_token(ctx: typer.Context, token_id: str = typer.Argument(...)):
+    """Revoke an API token."""
+    _client(ctx).request("DELETE", f"/admin/tokens/{token_id}", spinner="revoking…")
+    output.success(f"token {token_id} revoked")
+
+
+@admin_app.command("audit")
+def admin_audit(ctx: typer.Context, limit: int = typer.Option(40, "--limit"),
+                out: Optional[str] = OUTPUT_OPT):
+    """Show the audit trail (most recent first)."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    rows = _client(ctx).get("/audit", params={"limit": limit})
+    output.emit(rows, g.output, columns=[
+        ("when", "ts"), ("actor", "actor"), ("action", "action"),
+        ("target", "target"), ("result", "result"), ("source", "source"),
+    ], title="audit log")
 
 
 @app.command("cancel", hidden=True)
