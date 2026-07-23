@@ -539,11 +539,106 @@ def admin_update_user(user_id: int, body: UpdateUserBody, who: str = Depends(aut
     user = db.get_user_by_id(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="user not found")
+    demoting = (body.active is False) or (body.role is not None and body.role != "admin")
+    if user["role"] == "admin" and user["active"] and demoting and db.count_active_admins() <= 1:
+        raise HTTPException(status_code=409, detail="USER_IS_FINAL_ADMIN")
     db.update_user(user_id, role=body.role,
                    active=(None if body.active is None else (1 if body.active else 0)),
                    display_name=body.display_name, email=body.email)
     db.add_audit(who, "admin.user.update", user["username"], source="api")
     return db.user_public(db.get_user_by_id(user_id))
+
+
+def _user_or_404(user_id: int) -> dict:
+    u = db.get_user_by_id(user_id)
+    if u is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    return u
+
+
+def _active_tokens_for(username: str) -> int:
+    return sum(1 for t in db.list_api_tokens() if t["owner"] == username and not t["revoked"])
+
+
+def _active_jobs_for(username: str) -> int:
+    n = 0
+    for st in ("queued", "running"):
+        n += sum(1 for j in db.list_jobs(status=st, limit=1000) if j.get("requested_by") == username)
+    return n
+
+
+@app.get("/admin/users/{user_id}")
+def admin_get_user(user_id: int, _: str = Depends(authn.actor("admin"))) -> dict:
+    u = _user_or_404(user_id)
+    pub = db.user_public(u)
+    pub["active_sessions"] = db.count_active_sessions_for_user(user_id)
+    pub["active_tokens"] = _active_tokens_for(u["username"])
+    pub["active_jobs"] = _active_jobs_for(u["username"])
+    return pub
+
+
+@app.post("/admin/users/{user_id}/disable")
+def admin_disable_user(user_id: int, who: str = Depends(authn.actor("admin"))) -> dict:
+    u = _user_or_404(user_id)
+    if u["username"] == who:
+        raise HTTPException(status_code=409, detail="CANNOT_DISABLE_SELF")
+    if u["role"] == "admin" and u["active"] and db.count_active_admins() <= 1:
+        raise HTTPException(status_code=409, detail="USER_IS_FINAL_ADMIN")
+    db.update_user(user_id, active=0)
+    revoked = db.revoke_user_sessions(user_id)
+    db.add_audit(who, "admin.user.disable", u["username"], source="api")
+    return {"ok": True, "sessions_revoked": revoked}
+
+
+@app.post("/admin/users/{user_id}/enable")
+def admin_enable_user(user_id: int, who: str = Depends(authn.actor("admin"))) -> dict:
+    u = _user_or_404(user_id)
+    db.update_user(user_id, active=1)
+    db.add_audit(who, "admin.user.enable", u["username"], source="api")
+    return {"ok": True}
+
+
+@app.post("/admin/users/{user_id}/force-logout")
+def admin_force_logout(user_id: int, who: str = Depends(authn.actor("admin"))) -> dict:
+    u = _user_or_404(user_id)
+    revoked = db.revoke_user_sessions(user_id)
+    db.add_audit(who, "admin.user.force_logout", u["username"], source="api")
+    return {"ok": True, "sessions_revoked": revoked}
+
+
+@app.post("/admin/users/{user_id}/anonymise")
+def admin_anonymise_user(user_id: int, who: str = Depends(authn.actor("admin"))) -> dict:
+    u = _user_or_404(user_id)
+    if u["username"] == who:
+        raise HTTPException(status_code=409, detail="CANNOT_ANONYMISE_SELF")
+    if u["role"] == "admin" and u["active"] and db.count_active_admins() <= 1:
+        raise HTTPException(status_code=409, detail="USER_IS_FINAL_ADMIN")
+    anon = f"deleted_user_{user_id}"
+    db.anonymise_user(user_id, anon, authn.hash_password(secrets.token_urlsafe(32)))
+    db.revoke_user_sessions(user_id)
+    for t in db.list_api_tokens():
+        if t["owner"] == u["username"] and not t["revoked"]:
+            db.revoke_api_token(t["id"])
+    db.add_audit(who, "admin.user.anonymise", anon, reason=f"was {u['username']}", source="api")
+    return {"ok": True, "username": anon}
+
+
+@app.delete("/admin/users/{user_id}")
+def admin_delete_user(user_id: int, who: str = Depends(authn.actor("admin"))) -> dict:
+    u = _user_or_404(user_id)
+    if u["username"] == who:
+        raise HTTPException(status_code=409, detail="CANNOT_DELETE_SELF")
+    if u["role"] == "admin" and u["active"] and db.count_active_admins() <= 1:
+        raise HTTPException(status_code=409, detail="USER_IS_FINAL_ADMIN")
+    if db.count_active_sessions_for_user(user_id) > 0:
+        raise HTTPException(status_code=409, detail="USER_HAS_ACTIVE_SESSIONS")
+    if _active_tokens_for(u["username"]) > 0:
+        raise HTTPException(status_code=409, detail="USER_HAS_ACTIVE_TOKENS")
+    if _active_jobs_for(u["username"]) > 0:
+        raise HTTPException(status_code=409, detail="USER_HAS_ACTIVE_JOBS")
+    db.delete_user(user_id)
+    db.add_audit(who, "admin.user.delete", u["username"], source="api")
+    return {"ok": True}
 
 
 @app.post("/admin/users/{user_id}/reset-password")

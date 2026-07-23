@@ -725,6 +725,41 @@ def update_user(user_id: int, **fields) -> bool:
         return cur.rowcount > 0
 
 
+def count_active_admins() -> int:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+
+
+def revoke_user_sessions(user_id: int) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE sessions SET revoked=1 WHERE user_id=? AND (revoked IS NULL OR revoked=0)",
+            (user_id,))
+        return cur.rowcount
+
+
+def count_active_sessions_for_user(user_id: int) -> int:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE user_id=? AND (revoked IS NULL OR revoked=0) "
+            "AND expires_at > ?", (user_id, now_iso())).fetchone()[0]
+
+
+def anonymise_user(user_id: int, anon_username: str, password_hash: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE users SET username=?, display_name=NULL, email=NULL, password_hash=?, "
+            "active=0 WHERE id=?", (anon_username, password_hash, user_id))
+        return cur.rowcount > 0
+
+
+def delete_user(user_id: int) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+        return cur.rowcount > 0
+
+
 def create_api_token(token_id: str, name: str, owner: str, token_hash: str,
                      scopes: str, expires_at: str | None) -> None:
     with _connect() as conn:
