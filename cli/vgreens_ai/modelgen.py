@@ -242,11 +242,13 @@ def main() -> int:
     inputs = sorted(p for p in DATA.rglob("*") if p.is_file())
 
     # ===== REPLACE: run real inference with `model` over `inputs` =====
+    kind = model.get("kind", "custom") if isinstance(model, dict) else "custom"
     results = len(inputs)
     # =================================================================
 
     report = {"model": os.environ.get("MODEL_NAME", ""),
               "model_version": os.environ.get("MODEL_VERSION", ""),
+              "model_kind": kind,
               "inputs": len(inputs), "results": results}
     (OUT / "report.json").write_text(json.dumps(report, indent=2))
     print(f"[process] done: {report}", flush=True)

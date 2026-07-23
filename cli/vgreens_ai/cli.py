@@ -377,8 +377,12 @@ def _create_gitlab_repo(spec: dict, out_dir: str) -> None:
     _git("-c", "user.email=cli@vgreens", "-c", "user.name=vgreens-ai",
          "commit", "-q", "-m", "chore: scaffold model repo")
     _git("remote", "add", "origin", clean_url)                       # clean URL persisted
-    push_url = clean_url.replace("https://", f"https://oauth2:{token}@")
-    subprocess.run(["git", "-C", out_dir, "push", "-u", push_url, "main"], check=True)
+    # Push with a one-shot credential helper so the token is never written into
+    # .git/config or printed in git output (embedding it in the URL leaks it).
+    helper = '!f() { echo "username=oauth2"; echo "password=$GITLAB_TOKEN"; }; f'
+    subprocess.run(["git", "-C", out_dir, "-c", f"credential.helper={helper}",
+                    "push", "-u", "origin", "main"],
+                   check=True, env={**os.environ, "GITLAB_TOKEN": token})
     output.success(f"pushed to {proj['web_url']} — pipeline starts on the group runner")
 
 
