@@ -610,11 +610,10 @@ def system_doctor(ctx: typer.Context):
 # --------------------------------------------------------------------------- #
 # config group
 # --------------------------------------------------------------------------- #
-@config_app.command("init")
-def config_init(profile: str = typer.Option("prod", help="profile name"),
-                api_url: str = typer.Option(None, help="skip the prompt with this URL"),
-                token: str = typer.Option(None, help="skip the prompt with this token")):
-    """Guided setup: prompt, validate reachability + auth, save securely."""
+def _config_init_flow(profile: str = "prod", api_url: Optional[str] = None,
+                      token: Optional[str] = None) -> None:
+    """Prompt, validate reachability + auth, save securely. Shared by `config init`
+    and `quickstart` so the guided setup lives in one place."""
     url = api_url or typer.prompt("Platform API URL (e.g. https://ai.internal/api)")
     url = url.rstrip("/")
     # validate reachability before asking for a secret
@@ -638,6 +637,14 @@ def config_init(profile: str = typer.Option("prod", help="profile name"),
     config.save_profile(profile, url, tok, make_default=True)
     output.success(f"saved profile '{profile}' to {config.CONFIG_PATH} (chmod 600). "
                    f"Token stored: {config.redact(tok)}")
+
+
+@config_app.command("init")
+def config_init(profile: str = typer.Option("prod", help="profile name"),
+                api_url: str = typer.Option(None, help="skip the prompt with this URL"),
+                token: str = typer.Option(None, help="skip the prompt with this token")):
+    """Guided setup: prompt, validate reachability + auth, save securely."""
+    _config_init_flow(profile, api_url, token)
 
 
 @config_app.command("show")
@@ -672,6 +679,74 @@ def config_use(profile: str = typer.Argument(...)):
     except config.ConfigError as exc:
         raise CLIError(str(exc), 1)
     output.success(f"default profile is now '{profile}'")
+
+
+@app.command("whoami")
+def whoami(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
+    """Show who the current profile/token authenticates as, and its role."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    me = _client(ctx).get("/auth/me")
+    if g.output == "table":
+        output.info(f"{me.get('username')} · role {output.badge(me.get('role'))} · via {me.get('via')}")
+        if me.get("scopes"):
+            output.info(f"scopes: {me['scopes']}")
+    else:
+        output.emit(me, g.output)
+
+
+@app.command("quickstart")
+def quickstart(ctx: typer.Context):
+    """Guided first run: configure a profile, verify connectivity + identity,
+    and print role-tailored next steps."""
+    g: G = ctx.obj
+    try:
+        configured = bool(config.default_profile())
+    except Exception:  # noqa: BLE001
+        configured = False
+    if not configured and not (g.api_url and g.token):
+        output.info("No profile configured yet — let's set one up.")
+        _config_init_flow()
+
+    c = _client(ctx)
+    try:
+        ver = c.get("/version")
+        output.success(f"connected · API {ver.get('version', '?')}")
+    except CLIError as exc:
+        raise CLIError(f"cannot reach the platform: {exc} — run `vgreens-ai config init`", exc.code)
+
+    me = c.get("/auth/me")
+    role = me.get("role", "viewer")
+    output.success(f"authenticated as {me.get('username')} (role: {role})")
+
+    try:
+        ov = c.get("/system/overview")
+        w = ov.get("workers", {}) or {}
+        output.info(f"workers online: {w.get('online', '?')}/{w.get('total', '?')} · "
+                    f"queued jobs: {ov.get('queued_total', '?')}")
+    except CLIError:
+        pass
+
+    output.err.print("")
+    output.info("Next steps:")
+    lines = [
+        "vgreens-ai job list            see recent jobs",
+        "vgreens-ai model list          registered models",
+        "vgreens-ai system overview     platform health",
+    ]
+    if role in ("operator", "admin"):
+        lines += [
+            "vgreens-ai model init          scaffold a new custom model",
+            "vgreens-ai dataset import ...  bring in a dataset",
+            "vgreens-ai job train ...       start a training run",
+        ]
+    if role == "admin":
+        lines += [
+            "vgreens-ai admin users         manage accounts",
+            "vgreens-ai admin audit         review the audit trail",
+        ]
+    for line in lines:
+        output.err.print(f"  {line}")
 
 
 # --------------------------------------------------------------------------- #
