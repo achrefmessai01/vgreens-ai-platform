@@ -1066,6 +1066,113 @@ def version() -> dict:
     return {"name": "vGreens Job API", "version": VERSION, "api": API_LEVEL, "commit": COMMIT}
 
 
+# --------------------------------------------------------------------------- #
+# Curated monitoring for the web app. The browser never queries Prometheus;
+# the API aggregates from the DB/FS and (best-effort) Prometheus, and degrades
+# gracefully so a Prometheus outage shows "unknown", not a false "healthy".
+# --------------------------------------------------------------------------- #
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
+
+
+def _prom(path: str, params: dict | None = None, timeout: float = 3.0) -> Optional[dict]:
+    import urllib.parse
+    import urllib.request
+    url = f"{PROMETHEUS_URL}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:  # noqa: S310 - internal URL
+            return json.loads(r.read().decode())
+    except Exception:  # noqa: BLE001 - monitoring must degrade, not crash
+        return None
+
+
+def _queue_state() -> list[dict]:
+    now = datetime.now(timezone.utc)
+    out = []
+    for jt in ("training", "processing"):
+        q = db.list_jobs(status="queued", job_type=jt, limit=1000)
+        ages = []
+        for j in q:
+            try:
+                ages.append((now - datetime.fromisoformat(j["created_at"])).total_seconds())
+            except (TypeError, ValueError):
+                pass
+        out.append({"type": jt, "depth": len(q),
+                    "oldest_seconds": round(max(ages)) if ages else 0})
+    return out
+
+
+def _backup_state() -> dict:
+    import glob
+    d = os.path.join(os.path.dirname(NAS_JOBS_ROOT), "backups")
+    files = sorted(glob.glob(os.path.join(d, "jobs.db.*")), key=os.path.getmtime, reverse=True)
+    if not files:
+        return {"latest": None, "count": 0, "age_seconds": None}
+    st = os.stat(files[0])
+    return {"latest": os.path.basename(files[0]), "count": len(files),
+            "age_seconds": round(time.time() - st.st_mtime), "size_bytes": st.st_size}
+
+
+def _alerts_state() -> dict:
+    d = _prom("/api/v1/alerts")
+    if d is None or d.get("status") != "success":
+        return {"available": False, "alerts": []}
+    alerts = []
+    for a in d.get("data", {}).get("alerts", []):
+        lbl, ann = a.get("labels", {}), a.get("annotations", {})
+        alerts.append({"name": lbl.get("alertname"), "severity": lbl.get("severity"),
+                       "component": lbl.get("component"), "state": a.get("state"),
+                       "summary": ann.get("summary"), "runbook": ann.get("runbook")})
+    return {"available": True, "alerts": alerts}
+
+
+@app.get("/system/queues")
+def system_queues(_: str = Depends(authn.actor("viewer"))) -> dict:
+    return {"queues": _queue_state()}
+
+
+@app.get("/system/backups")
+def system_backups(_: str = Depends(authn.actor("viewer"))) -> dict:
+    return _backup_state()
+
+
+@app.get("/system/alerts")
+def system_alerts(_: str = Depends(authn.actor("viewer"))) -> dict:
+    return _alerts_state()
+
+
+@app.get("/system/overview")
+def system_overview(_: str = Depends(authn.actor("viewer"))) -> dict:
+    now = datetime.now(timezone.utc)
+    workers = db.list_workers()
+    online = 0
+    for w in workers:
+        try:
+            if (now - datetime.fromisoformat(w["last_seen"])).total_seconds() < 90:
+                online += 1
+        except (TypeError, ValueError):
+            pass
+    queues = _queue_state()
+    alerts = _alerts_state()
+    sev = {"critical": 0, "warning": 0}
+    for a in alerts["alerts"]:
+        if a["state"] in ("firing",) and a["severity"] in sev:
+            sev[a["severity"]] += 1
+    return {
+        "nas_mounted": os.path.ismount(NAS_MOUNTPOINT),
+        "workers": {"online": online, "total": len(workers)},
+        "gpus": _query_gpus(),
+        "queues": queues,
+        "queued_total": sum(q["depth"] for q in queues),
+        "oldest_queued_seconds": max((q["oldest_seconds"] for q in queues), default=0),
+        "jobs_by_status": db.count_by_status(),
+        "backups": _backup_state(),
+        "alerts": {"available": alerts["available"], "firing": sev,
+                   "list": [a for a in alerts["alerts"] if a["state"] == "firing"]},
+    }
+
+
 @app.get("/health/live")
 def health_live() -> dict:
     """Liveness: is the process up? Deliberately cheap — no dependency checks, so a
