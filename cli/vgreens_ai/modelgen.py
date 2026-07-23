@@ -64,9 +64,13 @@ def main() -> int:
     dy["path"] = str(WORK)
     data_yaml.write_text(yaml.dump(dy))
 
-    print(f"[train] model={model_name} epochs={epochs} imgsz={imgsz} batch={batch}", flush=True)
+    # device follows GPU_COUNT: 1 GPU -> 0, 2 GPUs -> [0,1] (ultralytics DDP).
+    gpu_count = int(os.environ.get("GPU_COUNT", "1"))
+    device = list(range(gpu_count)) if gpu_count > 1 else 0
+    print(f"[train] model={model_name} epochs={epochs} imgsz={imgsz} batch={batch} "
+          f"gpu_count={gpu_count} device={device}", flush=True)
     model = YOLO(model_name)
-    model.train(data=str(data_yaml), epochs=epochs, imgsz=imgsz, batch=batch, device=0,
+    model.train(data=str(data_yaml), epochs=epochs, imgsz=imgsz, batch=batch, device=device,
                 project=str(OUT / "runs"), name="train", exist_ok=True, plots=True, verbose=True)
 
     metrics = model.val(data=str(data_yaml), device=0, project=str(OUT / "runs"),

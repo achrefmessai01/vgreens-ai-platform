@@ -21,8 +21,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
-from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Gauge, generate_latest
+import time
+
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
+from prometheus_client import (
+    CONTENT_TYPE_LATEST, REGISTRY, CollectorRegistry, Counter, Gauge, Histogram,
+    generate_latest,
+)
 from pydantic import BaseModel, Field
 
 import db
@@ -67,6 +72,36 @@ app = FastAPI(title="vGreens Job API", version=VERSION)
 def _startup() -> None:
     db.init_db()
     authn.seed_admin_if_empty()
+
+
+# --------------------------------------------------------------------------- #
+# HTTP metrics (persistent on the default registry). Labels are bounded: the
+# route TEMPLATE (e.g. /jobs/{job_id}), the method, and the status class — never
+# raw paths/IDs, so cardinality stays flat.
+# --------------------------------------------------------------------------- #
+HTTP_REQUESTS = Counter("vgreens_http_requests_total", "HTTP requests",
+                        ["method", "route", "status_class"])
+HTTP_LATENCY = Histogram("vgreens_http_request_duration_seconds",
+                         "HTTP request latency (s)", ["method", "route"])
+AUTH_FAILURES = Counter("vgreens_auth_failures_total", "Requests rejected with 401")
+AUTHZ_DENIALS = Counter("vgreens_authz_denials_total", "Requests rejected with 403")
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    route = request.scope.get("route")
+    tmpl = getattr(route, "path", None) or "unmatched"
+    method = request.method
+    HTTP_REQUESTS.labels(method=method, route=tmpl,
+                         status_class=f"{response.status_code // 100}xx").inc()
+    HTTP_LATENCY.labels(method=method, route=tmpl).observe(time.perf_counter() - start)
+    if response.status_code == 401:
+        AUTH_FAILURES.inc()
+    elif response.status_code == 403:
+        AUTHZ_DENIALS.inc()
+    return response
 
 
 # --------------------------------------------------------------------------- #
@@ -896,27 +931,87 @@ def get_dataset_version(dataset_name: str, version: str, _: str = Depends(authn.
     return v
 
 
+def _newest_backup_age_seconds() -> Optional[float]:
+    """Age (s) of the newest jobs.db backup on the NAS, or None if unknown."""
+    import glob
+    backups_dir = os.path.join(os.path.dirname(NAS_JOBS_ROOT), "backups")
+    files = glob.glob(os.path.join(backups_dir, "jobs.db.*"))
+    if not files:
+        return None
+    return max(0.0, time.time() - max(os.path.getmtime(f) for f in files))
+
+
 @app.get("/metrics")
 def metrics() -> Response:
-    """Prometheus metrics. Unauthenticated on purpose (operational, LAN-only)."""
+    """Prometheus metrics. Unauthenticated on purpose (operational, LAN-only).
+
+    HTTP counters/histograms live on the default REGISTRY (persistent across
+    scrapes); the state below is computed fresh each scrape from the DB/FS.
+    """
     reg = CollectorRegistry()
+    now = datetime.now(timezone.utc)
+
     jobs = Gauge("vgreens_jobs", "Jobs by status", ["status"], registry=reg)
     for status, n in db.count_by_status().items():
         jobs.labels(status=status).set(n)
+
+    # queue depth + oldest queued age, per job type
+    qd = Gauge("vgreens_queue_depth", "Queued jobs by type", ["type"], registry=reg)
+    oldest = Gauge("vgreens_oldest_queued_seconds",
+                   "Age of the oldest queued job by type", ["type"], registry=reg)
+    for jt in ("training", "processing"):
+        q = db.list_jobs(status="queued", job_type=jt, limit=1000)
+        qd.labels(type=jt).set(len(q))
+        ages = []
+        for j in q:
+            try:
+                ages.append((now - datetime.fromisoformat(j["created_at"])).total_seconds())
+            except (TypeError, ValueError):
+                pass
+        oldest.labels(type=jt).set(max(ages) if ages else 0.0)
+
+    # NAS + filesystem
     nas = Gauge("vgreens_nas_mounted", "NAS mounted (1) or not (0)", registry=reg)
     nas.set(1 if os.path.ismount(NAS_MOUNTPOINT) else 0)
+    nas_free = Gauge("vgreens_nas_free_bytes", "NAS free space (bytes)", registry=reg)
+    try:
+        st = os.statvfs(NAS_MOUNTPOINT)
+        nas_free.set(st.f_bavail * st.f_frsize)
+    except OSError:
+        pass
 
-    # seconds since each worker last checked in (drives the worker-stopped alert)
+    # backup freshness (drives the backup-too-old alert)
+    bak = Gauge("vgreens_backup_age_seconds",
+                "Age of the newest jobs.db backup (s); absent if none found", registry=reg)
+    ba = _newest_backup_age_seconds()
+    if ba is not None:
+        bak.set(ba)
+
+    # dataset imports by state + licence gate
+    di = Gauge("vgreens_dataset_imports", "Dataset imports by state", ["state"], registry=reg)
+    lic = Gauge("vgreens_licence_approvals_waiting",
+                "Dataset imports awaiting licence approval", registry=reg)
+    try:
+        from collections import Counter as _C
+        states = _C(i["state"] for i in db.list_dataset_imports(limit=1000))
+        for stt, n in states.items():
+            di.labels(state=stt).set(n)
+        lic.set(states.get("awaiting_license_approval", 0))
+    except Exception:  # noqa: BLE001 - metrics must never break a scrape
+        pass
+
+    # worker heartbeat (drives the worker-stopped alert)
     age = Gauge("vgreens_worker_seconds_since_heartbeat",
                 "Seconds since the worker last sent a heartbeat", ["worker"], registry=reg)
-    now = datetime.now(timezone.utc)
     for w in db.list_workers():
         try:
-            last = datetime.fromisoformat(w["last_seen"])
-            age.labels(worker=w["name"]).set((now - last).total_seconds())
+            age.labels(worker=w["name"]).set(
+                (now - datetime.fromisoformat(w["last_seen"])).total_seconds())
         except (TypeError, ValueError):
             pass
-    return Response(generate_latest(reg), media_type=CONTENT_TYPE_LATEST)
+
+    return Response(generate_latest(REGISTRY) + generate_latest(reg),
+                    media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/workers")

@@ -1,0 +1,33 @@
+groups:
+  - name: vgreens-recording
+    interval: 30s
+    rules:
+      # ---- API (from the HTTP middleware, default registry) ----
+      - record: job:http_request_rate5m
+        expr: sum(rate(vgreens_http_requests_total[5m]))
+      - record: job:http_5xx_rate5m
+        expr: sum(rate(vgreens_http_requests_total{status_class="5xx"}[5m]))
+      - record: job:http_error_ratio5m
+        expr: |
+          sum(rate(vgreens_http_requests_total{status_class="5xx"}[5m]))
+          / clamp_min(sum(rate(vgreens_http_requests_total[5m])), 1)
+      - record: job:http_p95_seconds5m
+        expr: histogram_quantile(0.95, sum(rate(vgreens_http_request_duration_seconds_bucket[5m])) by (le))
+      - record: job:auth_failure_rate5m
+        expr: sum(rate(vgreens_auth_failures_total[5m]))
+
+      # ---- Jobs (all-time counts from the DB gauge; coarse but useful) ----
+      - record: job:job_failure_ratio
+        expr: |
+          sum(vgreens_jobs{status="failed"})
+          / clamp_min(sum(vgreens_jobs{status=~"failed|succeeded|cancelled"}), 1)
+      - record: job:queue_depth_total
+        expr: sum(vgreens_queue_depth)
+      - record: job:oldest_queued_seconds_max
+        expr: max(vgreens_oldest_queued_seconds)
+
+      # ---- Workers (availability) ----
+      - record: job:gpu_workers_online
+        expr: count(vgreens_worker_seconds_since_heartbeat{worker=~".*@[0-9]+"} < 90) or vector(0)
+      - record: job:gpu_workers_total
+        expr: count(vgreens_worker_seconds_since_heartbeat{worker=~".*@[0-9]+"})

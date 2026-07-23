@@ -64,3 +64,137 @@ groups:
         annotations:
           summary: "Host root filesystem over 85% full"
           description: "Less than 15% free on the host root filesystem."
+
+  - name: vgreens-platform-extended
+    rules:
+      - alert: AllGPUWorkersOffline
+        expr: min(vgreens_worker_seconds_since_heartbeat{worker=~".*@[0-9]+"}) > 90
+        for: 1m
+        labels: {severity: critical, component: workers}
+        annotations:
+          summary: "All GPU workers are offline"
+          description: "No GPU worker has sent a heartbeat in >90s — no training/processing can run."
+          cause: "Both vgreens-worker@N crashed, the host rebooted, or RabbitMQ is unreachable."
+          diagnostic: "systemctl status 'vgreens-worker@*'; journalctl -u vgreens-worker@0 -n 50"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/gpus"
+          runbook: "docs/runbooks/worker-down.md"
+
+      - alert: DatasetWorkerOffline
+        expr: vgreens_worker_seconds_since_heartbeat{worker=~".*@dataset"} > 120
+        for: 2m
+        labels: {severity: warning, component: dataset-factory}
+        annotations:
+          summary: "Dataset worker offline"
+          description: "The dataset worker has not checked in for >120s — imports will not progress."
+          cause: "vgreens-dataset-worker stopped or RabbitMQ dataset_jobs is unreachable."
+          diagnostic: "systemctl status vgreens-dataset-worker; journalctl -u vgreens-dataset-worker -n 50"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/datasets"
+          runbook: "docs/runbooks/dataset-worker-down.md"
+
+      - alert: BackupTooOld
+        expr: vgreens_backup_age_seconds > 172800
+        for: 10m
+        labels: {severity: critical, component: backups}
+        annotations:
+          summary: "jobs.db backup is older than 48h"
+          description: "The newest jobs.db backup on the NAS is stale — recovery point is at risk."
+          cause: "vgreens-db-backup.timer failed or the NAS was unavailable at backup time."
+          diagnostic: "systemctl status vgreens-db-backup.service; ls -lt /mnt/vgreens_storage/ai/backups | head"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/infrastructure"
+          runbook: "docs/runbooks/backup-failed.md"
+
+      - alert: BackupMissing
+        expr: absent(vgreens_backup_age_seconds)
+        for: 15m
+        labels: {severity: warning, component: backups}
+        annotations:
+          summary: "No jobs.db backup found"
+          description: "The API reports no backup files on the NAS."
+          cause: "Backups never ran, or the backups directory is empty/unmounted."
+          diagnostic: "ls -l /mnt/vgreens_storage/ai/backups"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/infrastructure"
+          runbook: "docs/runbooks/backup-failed.md"
+
+      - alert: OldestQueuedJobTooOld
+        expr: max(vgreens_oldest_queued_seconds) > 1800
+        for: 10m
+        labels: {severity: warning, component: jobs}
+        annotations:
+          summary: "A job has been queued >30 min"
+          description: "The oldest queued job has waited over 30 minutes — workers may be stuck or busy."
+          cause: "All GPUs occupied, a stale GPU allocation, or workers down."
+          diagnostic: "vgreens-ai list-jobs; vgreens-ai gpu list"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/jobs"
+          runbook: "docs/runbooks/queue-growing.md"
+
+      - alert: QueueGrowing
+        expr: job:queue_depth_total > 20
+        for: 15m
+        labels: {severity: warning, component: jobs}
+        annotations:
+          summary: "Job queue is backing up (>20)"
+          description: "More than 20 jobs have been queued for 15 minutes."
+          cause: "Insufficient worker throughput or a blocked GPU allocation."
+          diagnostic: "vgreens-ai list-jobs --status queued"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/jobs"
+          runbook: "docs/runbooks/queue-growing.md"
+
+      - alert: LicenceApprovalWaiting
+        expr: vgreens_licence_approvals_waiting > 0
+        for: 6h
+        labels: {severity: warning, component: dataset-factory}
+        annotations:
+          summary: "Dataset licence approval pending >6h"
+          description: "A dataset import is blocked awaiting a human licence decision."
+          cause: "Nobody has approved/rejected the licence for a pending import."
+          diagnostic: "vgreens-ai dataset imports --state awaiting_license_approval"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/datasets"
+          runbook: "docs/runbooks/licence-approval-pending.md"
+
+      - alert: NASStorageLow
+        expr: vgreens_nas_free_bytes < 50e9
+        for: 10m
+        labels: {severity: warning, component: infrastructure}
+        annotations:
+          summary: "NAS free space below 50 GB"
+          description: "The NAS is running low on space — freezes and job outputs may fail."
+          cause: "Datasets/model artifacts accumulating on the NAS."
+          diagnostic: "df -h /mnt/vgreens_storage"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/infrastructure"
+          runbook: "docs/runbooks/disk-low.md"
+
+      - alert: APIErrorRateHigh
+        expr: job:http_error_ratio5m > 0.05
+        for: 10m
+        labels: {severity: warning, component: api}
+        annotations:
+          summary: "API 5xx error ratio > 5%"
+          description: "More than 5% of API requests have returned 5xx for 10 minutes."
+          cause: "A backend fault, DB/NAS/broker dependency failure, or a bad deploy."
+          diagnostic: "journalctl -u vgreens-ai-api -n 100"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/overview"
+          runbook: "docs/runbooks/api-down.md"
+
+      - alert: APILatencyHigh
+        expr: job:http_p95_seconds5m > 1
+        for: 10m
+        labels: {severity: warning, component: api}
+        annotations:
+          summary: "API p95 latency > 1s"
+          description: "95th-percentile API latency has exceeded 1s for 10 minutes."
+          cause: "DB contention, slow NAS, or resource pressure on the host."
+          diagnostic: "journalctl -u vgreens-ai-api -n 100; top -b -n1 | head"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/overview"
+          runbook: "docs/runbooks/api-down.md"
+
+      - alert: AuthFailureSpike
+        expr: job:auth_failure_rate5m > 1
+        for: 5m
+        labels: {severity: warning, component: api}
+        annotations:
+          summary: "Elevated authentication failures"
+          description: "More than 1 auth failure/s (5m avg) for 5 minutes — possible misconfig or brute force."
+          cause: "Wrong credentials in an automation, an expired token, or an attack."
+          diagnostic: "vgreens-ai admin audit list --action login --result failure"
+          dashboard: "https://app.vgreens.lan:9443/monitoring/overview"
+          runbook: "docs/runbooks/authentication-spike.md"
