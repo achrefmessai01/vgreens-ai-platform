@@ -23,7 +23,7 @@ from typing import Literal, Optional
 
 import time
 
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST, REGISTRY, CollectorRegistry, Counter, Gauge, Histogram,
     generate_latest,
@@ -1266,6 +1266,61 @@ def system_overview(_: str = Depends(authn.actor("viewer"))) -> dict:
         "alerts": {"available": alerts["available"], "firing": sev,
                    "list": [a for a in alerts["alerts"] if a["state"] == "firing"]},
     }
+
+
+# Curated time-series. The browser may ONLY pick a window from a fixed allowlist;
+# the PromQL is a fixed server-side dict (recording rules), never client-supplied.
+_TIMESERIES_QUERIES: dict[str, str] = {
+    "api_request_rate": "job:http_request_rate5m",
+    "api_p95_seconds": "job:http_p95_seconds5m",
+    "api_error_ratio": "job:http_error_ratio5m",
+    "queue_depth": "job:queue_depth_total",
+    "oldest_queued_seconds": "job:oldest_queued_seconds_max",
+    "gpu_workers_online": "job:gpu_workers_online",
+}
+# window (seconds) -> step (seconds); ~60 points per series
+_TIMESERIES_RANGES: dict[str, tuple[int, int]] = {
+    "1h": (3600, 60), "6h": (21600, 360), "24h": (86400, 1440),
+}
+
+
+def _prom_range(promql: str, start: float, end: float, step: int) -> Optional[list]:
+    d = _prom("/api/v1/query_range",
+              {"query": promql, "start": f"{start:.0f}", "end": f"{end:.0f}", "step": step})
+    if d is None or d.get("status") != "success":
+        return None
+    res = d.get("data", {}).get("result", [])
+    if not res:
+        return []
+    out = []
+    for t, v in res[0].get("values", []):
+        try:
+            fv = None if v in ("NaN", "+Inf", "-Inf") else float(v)
+        except (TypeError, ValueError):
+            fv = None
+        out.append([float(t), fv])
+    return out
+
+
+@app.get("/system/timeseries")
+def system_timeseries(range_: str = Query("1h", alias="range"),
+                      _: str = Depends(authn.actor("viewer"))) -> dict:
+    if range_ not in _TIMESERIES_RANGES:
+        raise HTTPException(status_code=422,
+                            detail=f"range must be one of {sorted(_TIMESERIES_RANGES)}")
+    window, step = _TIMESERIES_RANGES[range_]
+    end = time.time()
+    start = end - window
+    series: dict[str, list] = {}
+    available = True
+    for name, promql in _TIMESERIES_QUERIES.items():
+        pts = _prom_range(promql, start, end, step)
+        if pts is None:
+            available = False
+            series[name] = []
+        else:
+            series[name] = pts
+    return {"range": range_, "step": step, "available": available, "series": series}
 
 
 @app.get("/health/live")
