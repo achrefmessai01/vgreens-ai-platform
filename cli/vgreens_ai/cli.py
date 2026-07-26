@@ -1119,7 +1119,7 @@ def admin_reset_password(ctx: typer.Context, user_id: int = typer.Argument(...),
     """Set a new password for a user."""
     if not password:
         password = typer.prompt("New password (min 8 chars)", hide_input=True, confirmation_prompt=True)
-    _client(ctx).post(f"/admin/users/{user_id}/reset-password", json={"password": password},
+    _client(ctx).post(f"/admin/users/{user_id}/reset-password", json={"new_password": password},
                       spinner="resetting…")
     output.success(f"password reset for user {user_id}")
 
