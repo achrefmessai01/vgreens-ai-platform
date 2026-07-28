@@ -80,3 +80,42 @@ class Client:
 
     def post(self, path: str, **kw) -> Any:
         return self.request("POST", path, **kw)
+
+    def delete(self, path: str, **kw) -> Any:
+        return self.request("DELETE", path, **kw)
+
+    def download(self, path: str, dest: str, *, params: dict | None = None,
+                 spinner: str | None = None) -> str:
+        """Stream a binary response to a local file. Maps HTTP errors to the same
+        exit codes as request()."""
+        import os
+        url = f"{self.api_url}{path}"
+        try:
+            ctx = output.err.status(spinner) if (spinner and not self.quiet) else None
+            if ctx:
+                ctx.__enter__()
+            try:
+                r = self._s.get(url, params=params, timeout=self.timeout, stream=True)
+            finally:
+                if ctx:
+                    ctx.__exit__(None, None, None)
+        except requests.exceptions.ConnectionError:
+            raise CLIError(f"cannot reach the API at {self.api_url}", EXIT_NETWORK)
+        except requests.exceptions.Timeout:
+            raise CLIError(f"request to {self.api_url} timed out after {self.timeout}s", EXIT_NETWORK)
+        if r.status_code == 401:
+            raise CLIError("authentication failed — check your token", EXIT_AUTH)
+        if r.status_code == 403:
+            raise CLIError("not permitted — your role can't perform this action", EXIT_AUTH)
+        if r.status_code == 404:
+            raise CLIError(self._detail(r) or "not found", EXIT_NOT_FOUND)
+        if r.status_code >= 400:
+            raise CLIError(self._detail(r) or f"download failed ({r.status_code})", EXIT_GENERIC)
+        if os.path.isdir(dest):
+            name = os.path.basename(params.get("path", "artifact")) if params else "artifact"
+            dest = os.path.join(dest, name or "artifact")
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        return dest

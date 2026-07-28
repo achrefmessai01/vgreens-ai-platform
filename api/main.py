@@ -24,6 +24,7 @@ from typing import Literal, Optional
 import time
 
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
 from prometheus_client import (
     CONTENT_TYPE_LATEST, REGISTRY, CollectorRegistry, Counter, Gauge, Histogram,
     generate_latest,
@@ -274,6 +275,117 @@ def read_job_events(job_id: str, _: str = Depends(authn.actor("viewer"))) -> lis
     return db.list_job_events(job_id)
 
 
+# --------------------------------------------------------------------------- #
+# job results / artifacts / logs
+#
+# A finished job's outputs live on the NAS under <output_path>/out (copied there
+# by the worker): training -> model.pt + eval/metrics.json + evaluation_report.md;
+# processing -> report.json (detections). Logs are teed to <output_path>/logs/
+# container.log. These read-only endpoints surface those files so the web app and
+# CLI can show results and download artifacts without anyone touching the NAS.
+# --------------------------------------------------------------------------- #
+_ARTIFACT_MAX = 500          # cap the listing so a huge run can't blow up a response
+
+
+def _job_out_dir(job: dict) -> Optional[Path]:
+    op = job.get("output_path")
+    return (Path(op) / "out") if op else None
+
+
+def _read_json_file(p: Path) -> Optional[dict]:
+    try:
+        return json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _list_artifacts(base: Path) -> list[dict]:
+    items: list[dict] = []
+    for p in sorted(base.rglob("*")):
+        if p.is_file():
+            try:
+                items.append({"path": str(p.relative_to(base)), "size_bytes": p.stat().st_size})
+            except OSError:
+                continue
+        if len(items) >= _ARTIFACT_MAX:
+            break
+    return items
+
+
+def _safe_artifact(job: dict, rel: str) -> Path:
+    """Resolve a caller-supplied relative path INSIDE the job's out dir only.
+    Guards against path traversal (../, absolute paths, symlink escape)."""
+    base = _job_out_dir(job)
+    if base is None or not base.is_dir():
+        raise HTTPException(status_code=404, detail="no outputs for this job")
+    base_r = base.resolve()
+    target = (base_r / rel).resolve()
+    if target != base_r and base_r not in target.parents:
+        raise HTTPException(status_code=400, detail="path escapes the job output directory")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="artifact not found")
+    return target
+
+
+@app.get("/jobs/{job_id}/result")
+def read_job_result(job_id: str, _: str = Depends(authn.actor("viewer"))) -> dict:
+    """Structured summary of a finished job's outputs (metrics for training,
+    detections for processing) plus a downloadable artifact list."""
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    base = _job_out_dir(job)
+    out: dict = {
+        "job_id": job_id, "job_type": job["job_type"], "status": job["status"],
+        "output_path": job.get("output_path"), "result_version": job.get("result_version"),
+        "available": bool(base and base.is_dir()),
+        "metrics": None, "report": None, "evaluation_report_md": None, "artifacts": [],
+    }
+    if not base or not base.is_dir():
+        return out
+    out["artifacts"] = _list_artifacts(base)
+    m = _read_json_file(base / "eval" / "metrics.json")
+    if m is not None:
+        out["metrics"] = m
+    rep = _read_json_file(base / "report.json")
+    if rep is not None:
+        out["report"] = rep
+    er = base / "evaluation_report.md"
+    if er.is_file():
+        try:
+            out["evaluation_report_md"] = er.read_text(errors="replace")[:20000]
+        except OSError:
+            pass
+    return out
+
+
+@app.get("/jobs/{job_id}/artifacts/download")
+def download_job_artifact(job_id: str, path: str = Query(..., min_length=1),
+                          _: str = Depends(authn.actor("viewer"))) -> FileResponse:
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    target = _safe_artifact(job, path)
+    return FileResponse(str(target), filename=target.name)
+
+
+@app.get("/jobs/{job_id}/logs")
+def read_job_logs(job_id: str, tail: int = Query(200, ge=1, le=5000),
+                  _: str = Depends(authn.actor("viewer"))) -> dict:
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    op = job.get("output_path")
+    logf = Path(op) / "logs" / "container.log" if op else None
+    if logf is None or not logf.is_file():
+        return {"available": False, "lines": [], "total_lines": 0}
+    try:
+        lines = logf.read_text(errors="replace").splitlines()
+    except OSError:
+        return {"available": False, "lines": [], "total_lines": 0}
+    return {"available": True, "lines": lines[-tail:], "total_lines": len(lines)}
+
+
 @app.get("/jobs")
 def read_jobs(
     response: Response,
@@ -405,6 +517,25 @@ def rollback_model(model: str, body: RollbackBody, who: str = Depends(authn.acto
         raise HTTPException(status_code=409, detail=str(exc))
     db.add_audit(who, "model.rollback", f"{model}:{res.get('active_version')}",
                  reason=body.reason, source="api")
+    return res
+
+
+@app.delete("/models/{model}")
+def delete_model(model: str, force: bool = False, who: str = Depends(authn.actor("admin"))) -> dict:
+    """Delete a model from the registry (admin only). Safe by default: the model
+    folder is *archived* to a `_trash` area on the NAS (recoverable), not hard-
+    deleted. Refuses to delete a model that still has an ACTIVE (production)
+    version unless force=true — roll back / deactivate it first."""
+    if model not in reg.list_models():
+        raise HTTPException(status_code=404, detail="model not found")
+    try:
+        res = reg.delete_model(model, who, force=force)
+    except reg.RegistryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=f"NAS unavailable: {exc}")
+    db.add_audit(who, "model.delete", model,
+                 reason=("forced (had active version)" if force else None), source="api")
     return res
 
 

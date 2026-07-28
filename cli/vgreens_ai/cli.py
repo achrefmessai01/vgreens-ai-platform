@@ -19,15 +19,42 @@ import typer
 from . import __version__, config, output, modelspec, modelgen
 from .client import CLIError, Client, EXIT_GENERIC
 
-app = typer.Typer(add_completion=True, no_args_is_help=True,
-                  help="vGreens AI platform CLI. Run `vgreens-ai config init` to get started.")
-job_app = typer.Typer(no_args_is_help=True, help="Submit and inspect jobs.")
-model_app = typer.Typer(no_args_is_help=True, help="Model registry: versions, promote, rollback.")
-worker_app = typer.Typer(no_args_is_help=True, help="GPU workers.")
-gpu_app = typer.Typer(no_args_is_help=True, help="GPUs.")
-system_app = typer.Typer(no_args_is_help=True, help="Platform health and diagnostics.")
-config_app = typer.Typer(no_args_is_help=True, help="CLI configuration and profiles.")
-dataset_app = typer.Typer(no_args_is_help=True, help="Datasets (where the server supports it).")
+app = typer.Typer(
+    add_completion=True, no_args_is_help=True, rich_markup_mode="rich",
+    help=(
+        "[bold]vGreens AI platform[/] — command-line client for datasets, models, "
+        "training/inference jobs and production control.\n\n"
+        "Everything goes through the Job API (the single control plane); this CLI never "
+        "touches the GPU box or the NAS directly. [bold]New here?[/] run "
+        "[cyan]vgreens-ai quickstart[/] (or [cyan]config init[/]) first.\n\n"
+        "[bold]Command groups[/]\n"
+        "  [cyan]dataset[/]  import & freeze training data       [cyan]job[/]     submit/track training & inference\n"
+        "  [cyan]model[/]    versions, compare, promote, delete  [cyan]worker[/]  GPU worker health\n"
+        "  [cyan]gpu[/]      live GPU utilisation                [cyan]system[/]  API health & diagnostics\n"
+        "  [cyan]config[/]   profiles & credentials              [cyan]admin[/]   users, tokens, audit (admin)\n\n"
+        "[bold]Typical flow[/]\n"
+        "  [dim]1. setup   [/] vgreens-ai config init  →  vgreens-ai whoami\n"
+        "  [dim]2. data    [/] vgreens-ai dataset import roboflow --dataset berries ...  →  dataset watch <id>\n"
+        "  [dim]3. train   [/] vgreens-ai job train --model vgreens_demo_detector --dataset demo_berries:v1\n"
+        "  [dim]4. results [/] vgreens-ai job watch <id>  →  job result <id>  →  job download <id> --path model.pt\n"
+        "  [dim]5. release [/] vgreens-ai model promote <model> <version>  →  job process --model <model>\n\n"
+        "[bold]Tips[/]  add [cyan]-o json[/]/[cyan]-o yaml[/] to any read command for scripting · "
+        "[cyan]--profile prod[/] switches environments · exit codes: 0 ok, 3 network, 4 auth, 5 not-found, 6 conflict."
+    ),
+)
+job_app = typer.Typer(no_args_is_help=True, rich_markup_mode="rich",
+    help="Submit and track jobs — [cyan]train[/], [cyan]process[/], [cyan]watch[/], "
+         "[cyan]result[/], [cyan]logs[/], [cyan]download[/], [cyan]cancel[/].")
+model_app = typer.Typer(no_args_is_help=True, rich_markup_mode="rich",
+    help="Model registry — [cyan]list/show/versions[/], [cyan]compare[/], "
+         "[cyan]promote[/]/[cyan]rollback[/] (production control), [cyan]onboard[/], [cyan]delete[/].")
+worker_app = typer.Typer(no_args_is_help=True, help="GPU workers — heartbeat and current job.")
+gpu_app = typer.Typer(no_args_is_help=True, help="GPUs — live utilisation, memory and temperature.")
+system_app = typer.Typer(no_args_is_help=True, help="Platform health and diagnostics (version, health, doctor).")
+config_app = typer.Typer(no_args_is_help=True, help="CLI configuration and profiles (API URL + token per environment).")
+dataset_app = typer.Typer(no_args_is_help=True, rich_markup_mode="rich",
+    help="Datasets — [cyan]import[/] (roboflow/local/nas), [cyan]freeze[/] tracking, "
+         "list versions, licence approval.")
 admin_app = typer.Typer(no_args_is_help=True, help="Administration: users, tokens, audit (admin only).")
 app.add_typer(job_app, name="job")
 app.add_typer(model_app, name="model")
@@ -239,6 +266,89 @@ def job_cancel(ctx: typer.Context, job_id: str = typer.Argument(...)):
     _job_cancel(ctx, job_id)
 
 
+def _fmt_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{int(size)}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}GB"
+
+
+@job_app.command("result")
+def job_result(ctx: typer.Context, job_id: str = typer.Argument(...),
+               out: Optional[str] = OUTPUT_OPT):
+    """Show a finished job's results.
+
+    Training  -> validation metrics (mAP50, precision, recall) + the registered
+                 model version.
+    Processing-> detection counts (total + per class).
+    Both      -> the list of output files; download one with `job download`.
+    """
+    _mode(ctx, out)
+    g: G = ctx.obj
+    r = _client(ctx).get(f"/jobs/{job_id}/result", spinner="loading result…")
+    if g.output != "table":
+        output.emit(r, g.output)
+        return
+    if not r.get("available"):
+        output.warn(f"no outputs on record for {job_id} (status: {r.get('status')}). "
+                    f"Results appear once the job succeeds.")
+        return
+    if r.get("result_version"):
+        output.info(f"registered model version: [bold]{r['result_version']}[/]")
+    if r.get("metrics"):
+        output.emit([{"metric": k, "value": v} for k, v in r["metrics"].items()], "table",
+                    columns=[("metric", "metric"), ("value", "value")], title=f"{job_id} metrics")
+    rep = r.get("report")
+    if isinstance(rep, dict):
+        summ = {k: rep[k] for k in ("images", "total_detections", "conf_threshold") if k in rep}
+        if summ:
+            output.emit(summ, "table", title=f"{job_id} processing summary")
+        if isinstance(rep.get("by_class"), dict) and rep["by_class"]:
+            output.emit([{"class": k, "detections": v} for k, v in rep["by_class"].items()], "table",
+                        columns=[("class", "class"), ("detections", "detections")],
+                        title="detections by class")
+    arts = r.get("artifacts") or []
+    if arts:
+        output.emit([{"file": a["path"], "size": _fmt_bytes(a["size_bytes"])} for a in arts], "table",
+                    columns=[("file", "file"), ("size", "size")], title=f"{job_id} artifacts")
+        output.info(f"outputs on NAS: [dim]{r.get('output_path')}/out[/]")
+        output.info(f"download a file: [bold]vgreens-ai job download {job_id} --path <file>[/]")
+
+
+@job_app.command("download")
+def job_download(ctx: typer.Context, job_id: str = typer.Argument(...),
+                 path: str = typer.Option(..., "--path", help="artifact path as shown by `job result`"),
+                 dest: Optional[str] = typer.Option(None, "--dest",
+                     help="local file or directory to save into (default: current dir)")):
+    """Download one output file from a finished job."""
+    import os
+    target = dest or os.getcwd()
+    saved = _client(ctx).download(f"/jobs/{job_id}/artifacts/download", target,
+                                  params={"path": path}, spinner="downloading…")
+    output.success(f"saved {saved}")
+
+
+@job_app.command("logs")
+def job_logs(ctx: typer.Context, job_id: str = typer.Argument(...),
+             tail: int = typer.Option(200, "--tail", help="last N lines"),
+             out: Optional[str] = OUTPUT_OPT):
+    """Show the tail of a job's container log."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    r = _client(ctx).get(f"/jobs/{job_id}/logs", params={"tail": tail})
+    if g.output != "table":
+        output.emit(r, g.output)
+        return
+    if not r.get("available"):
+        output.warn(f"no log on record for {job_id} yet.")
+        return
+    for line in r.get("lines", []):
+        print(line)
+    output.info(f"[dim]showing last {len(r.get('lines', []))} of {r.get('total_lines')} lines[/]")
+
+
 # --------------------------------------------------------------------------- #
 # model group
 # --------------------------------------------------------------------------- #
@@ -323,6 +433,30 @@ def model_rollback(ctx: typer.Context, model: str = typer.Argument(...),
         output.emit(res, g.output)
 
 
+@model_app.command("delete")
+def model_delete(ctx: typer.Context, model: str = typer.Argument(...),
+                 force: bool = typer.Option(False, "--force",
+                     help="delete even if the model has an ACTIVE production version"),
+                 yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt")):
+    """Delete a model from the registry (admin only).
+
+    Safe by default: the model is ARCHIVED to a recoverable `_trash` area on the
+    NAS, not hard-deleted. Refuses if the model still serves production (has an
+    active version) unless you pass --force.
+    """
+    g: G = ctx.obj
+    if not yes and sys.stdout.isatty():
+        typer.confirm(f"Delete model '{model}'? It will be archived (recoverable) and "
+                      f"disappear from the registry.", abort=True)
+    res = _client(ctx).delete(f"/models/{model}", params={"force": str(force).lower()},
+                              spinner="deleting…")
+    if g.output == "table":
+        note = " (forced — had an active version)" if res.get("forced") else ""
+        output.warn(f"deleted {model}{note}; archived to {res.get('archived_to')}")
+    else:
+        output.emit(res, g.output)
+
+
 @model_app.command("presets")
 def model_presets(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
     """List the model onboarding presets."""
@@ -374,11 +508,20 @@ def _create_gitlab_repo(spec: dict, out_dir: str) -> None:
     def _git(*args: str) -> None:
         subprocess.run(["git", "-C", out_dir, *args], check=True)
 
+    def _git_rc(*args: str) -> int:
+        return subprocess.run(["git", "-C", out_dir, *args],
+                              capture_output=True).returncode
+
     _git("init", "-q", "-b", "main")
     _git("add", "-A")
-    _git("-c", "user.email=cli@vgreens", "-c", "user.name=vgreens-ai",
-         "commit", "-q", "-m", "chore: scaffold model repo")
-    _git("remote", "add", "origin", clean_url)                       # clean URL persisted
+    # Idempotent on re-runs: commit only if there is something staged.
+    if _git_rc("diff", "--cached", "--quiet") != 0:
+        _git("-c", "user.email=cli@vgreens", "-c", "user.name=vgreens-ai",
+             "commit", "-q", "-m", "chore: scaffold model repo")
+    # Add-or-update origin so a second --create-repo run doesn't crash on an
+    # existing remote. clean URL (no token) is what gets persisted.
+    if _git_rc("remote", "set-url", "origin", clean_url) != 0:
+        _git("remote", "add", "origin", clean_url)
     # Push with a one-shot credential helper so the token is never written into
     # .git/config or printed in git output (embedding it in the URL leaks it).
     helper = '!f() { echo "username=oauth2"; echo "password=$GITLAB_TOKEN"; }; f'

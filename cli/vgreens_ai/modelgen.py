@@ -70,7 +70,10 @@ def main() -> int:
     print(f"[train] model={model_name} epochs={epochs} imgsz={imgsz} batch={batch} "
           f"gpu_count={gpu_count} device={device}", flush=True)
     model = YOLO(model_name)
+    # amp=False skips Ultralytics' AMP self-check, which does a probe inference on a
+    # bundled asset and crashes in offline containers (cv2.resize on a non-array).
     model.train(data=str(data_yaml), epochs=epochs, imgsz=imgsz, batch=batch, device=device,
+                amp=False,
                 project=str(OUT / "runs"), name="train", exist_ok=True, plots=True, verbose=True)
 
     metrics = model.val(data=str(data_yaml), device=0, project=str(OUT / "runs"),
@@ -136,7 +139,7 @@ def main() -> int:
     per_class, total = {}, 0
     for i in range(0, len(images), 64):
         for r in model.predict(source=[str(p) for p in images[i:i + 64]], device=device, conf=conf, verbose=False):
-            total += int(len(r.boxes))
+            total += len(r.boxes)
             for c in r.boxes.cls.tolist():
                 per_class[int(c)] = per_class.get(int(c), 0) + 1
     report = {"model": os.environ.get("MODEL_NAME", ""), "model_version": os.environ.get("MODEL_VERSION", ""),
@@ -272,10 +275,15 @@ def _dockerfile(base_model: str) -> str:
     # never depends on the Ubuntu package mirror being reachable.
     return f"""\
 # {base_model} detection image (ultralytics). PyTorch CUDA base proven on this host.
-FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
+# NumPy-1 base: torch 2.3.1 is built against NumPy 1.x, so it agrees with
+# ultralytics (which caps numpy<2) and the opencv-headless 4.9 (numpy-1) wheel.
+# The 2.4.1 tag drifted to a NumPy-2 build, which breaks torch.from_numpy once
+# ultralytics downgrades numpy to 1.x.
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 RUN pip install --no-cache-dir "ultralytics==8.3.0" pyyaml \\
  && pip uninstall -y opencv-python opencv-python-headless >/dev/null 2>&1 || true \\
- && pip install --no-cache-dir "opencv-python-headless<4.12"
+ && pip install --no-cache-dir "numpy==1.26.4" "opencv-python-headless==4.9.0.80" \\
+ && python -c "import numpy as np, cv2, torch; a=np.zeros((16,16,3),np.uint8); cv2.warpAffine(a, np.eye(2,3,dtype=np.float32),(16,16)); torch.from_numpy(a); from ultralytics import YOLO; print('env-check OK numpy', np.__version__, 'cv2', cv2.__version__, 'torch', torch.__version__)"
 RUN python -c "from ultralytics import YOLO; YOLO('{base_model}')"
 WORKDIR /app
 COPY train.py process.py entrypoint.py /app/

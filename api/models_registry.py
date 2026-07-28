@@ -187,6 +187,29 @@ def promote(model: str, version: str, by: str, reason: str | None = None) -> dic
     return active
 
 
+def delete_model(model: str, by: str, force: bool = False) -> dict:
+    """Delete a model. Safe-by-default: the model directory is *moved* into a
+    `_trash/` area on the same filesystem (atomic rename, recoverable), never
+    hard-removed. Refuses if the model still has an ACTIVE production version
+    unless `force` is set. `_trash` has no `versions/` child, so a trashed model
+    never reappears in `list_models()`."""
+    mdir = _model_dir(model)
+    if not mdir.is_dir() or not (mdir / "versions").is_dir():
+        raise RegistryError(f"model {model!r} not found")
+    active = (get_active(model) or {}).get("active_version")
+    if active and not force:
+        raise RegistryError(
+            f"model {model!r} has an active version {active!r}; roll back or "
+            f"deactivate it first, or delete with force=true")
+    trash = Path(REGISTRY_ROOT) / "_trash"
+    trash.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = trash / f"{model}__{stamp}"
+    os.replace(mdir, dest)   # atomic move on the same filesystem
+    return {"model": model, "deleted": True, "archived_to": str(dest),
+            "was_active": active, "forced": bool(active and force), "by": by}
+
+
 def rollback(model: str, to: str | None, by: str, reason: str | None = None) -> dict:
     current = get_active(model)
     if not current:
