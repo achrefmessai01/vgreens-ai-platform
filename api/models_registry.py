@@ -107,6 +107,52 @@ def get_model_summary(model: str) -> dict:
     }
 
 
+def _version_image(model: str, version: str) -> str | None:
+    """The docker_image recorded for a specific model version, if any."""
+    md = _read_json(_versions_dir(model) / version / "metadata.json")
+    img = md.get("docker_image")
+    return img.strip() if isinstance(img, str) and img.strip() else None
+
+
+def latest_version(model: str) -> str | None:
+    """Most recently created version (by metadata created_at, else dir name)."""
+    vd = _versions_dir(model)
+    if not vd.is_dir():
+        return None
+    cands: list[tuple[str, str]] = []
+    for d in vd.iterdir():
+        if d.is_dir():
+            md = _read_json(d / "metadata.json")
+            cands.append((md.get("created_at") or "", d.name))
+    if not cands:
+        return None
+    cands.sort()
+    return cands[-1][1]
+
+
+def resolve_image(model: str, job_type: str, version: str | None = None) -> str | None:
+    """Best-effort container image to run when the caller left docker_image blank.
+
+    processing -> the ACTIVE version's image (what production currently serves);
+    training   -> an explicit model version's image if given, else the LATEST
+                  version's image (reuse the last-built image for this model).
+    Returns None if the registry has no image on record yet (e.g. a brand-new
+    model that has never been trained) — the caller must then supply one.
+    """
+    if job_type == "processing":
+        active = (get_active(model) or {}).get("active_version")
+        if active:
+            img = _version_image(model, active)
+            if img:
+                return img
+    if version:
+        img = _version_image(model, version)
+        if img:
+            return img
+    lv = latest_version(model)
+    return _version_image(model, lv) if lv else None
+
+
 def _write_atomic(path: Path, data: dict) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2))

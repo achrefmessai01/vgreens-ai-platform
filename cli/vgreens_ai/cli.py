@@ -163,7 +163,7 @@ def _job_cancel(ctx, job_id):
 def job_train(ctx: typer.Context,
               model: str = typer.Option(..., help="model name"),
               dataset: str = typer.Option(..., help="dataset as name:version"),
-              image: str = typer.Option(..., help="docker image"),
+              image: Optional[str] = typer.Option(None, help="docker image (optional; resolved from the model registry if omitted)"),
               tenant: str = typer.Option(None), config: str = typer.Option(None, "--config"),
               gpu_count: int = typer.Option(1, "--gpu-count", help="1 or 2 (2 = both GPUs, admin only)"),
               yes: bool = typer.Option(False, "--yes", help="skip the two-GPU confirmation")):
@@ -177,7 +177,7 @@ def job_train(ctx: typer.Context,
 @job_app.command("process")
 def job_process(ctx: typer.Context,
                 model: str = typer.Option(..., help="model name"),
-                image: str = typer.Option(..., help="docker image"),
+                image: Optional[str] = typer.Option(None, help="docker image (optional; resolved from the model registry if omitted)"),
                 dataset: str = typer.Option(None, help="images to process, name:version"),
                 tenant: str = typer.Option(None), config: str = typer.Option(None, "--config")):
     """Submit a processing/inference job (serves the active model)."""
@@ -1005,7 +1005,7 @@ def _train(ctx: typer.Context, model: str = typer.Option(...), dataset: str = ty
 
 
 @app.command("process", hidden=True)
-def _process(ctx: typer.Context, model: str = typer.Option(...), image: str = typer.Option(...),
+def _process(ctx: typer.Context, model: str = typer.Option(...), image: Optional[str] = typer.Option(None),
              dataset: str = typer.Option(None), tenant: str = typer.Option(None),
              config: str = typer.Option(None, "--config")):
     _job_process(ctx, model, image, dataset, tenant, config)

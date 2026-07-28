@@ -113,7 +113,10 @@ class JobRequest(BaseModel):
     dataset_name: Optional[str] = None
     dataset_version: Optional[str] = None
     tenant: Optional[str] = None
-    docker_image: str = Field(..., min_length=1)
+    # Optional: if blank, the API resolves the image from the model registry
+    # (processing -> active version's image; training -> latest version's image).
+    docker_image: Optional[str] = None
+    model_version: Optional[str] = None   # optional explicit model version to reuse
     config_path: Optional[str] = None
     priority: int = 0
     gpu_count: int = 1                 # 1 or 2; 2 requires admin (two-GPU)
@@ -184,6 +187,19 @@ def create_job(req: JobRequest,
     if req.gpu_count == 2 and not authn.role_at_least(ident.role, "admin"):
         raise HTTPException(status_code=403,
                             detail="two-GPU training requires admin (jobs:two_gpu)")
+    # Resolve the container image. If the caller left it blank, reuse the
+    # model's registry image (processing -> active version; training -> latest).
+    image = (req.docker_image or "").strip()
+    if not image:
+        image = reg.resolve_image(req.model_name, req.job_type, req.model_version)
+        if not image:
+            raise HTTPException(
+                status_code=422,
+                detail=(f"no docker_image provided and none could be resolved for "
+                        f"model '{req.model_name}'. Supply docker_image, or build/"
+                        f"train the model once (via CI) so the registry has an "
+                        f"image to reuse."),
+            )
     requested_by = ident.username
     job_id = _new_job_id(req.job_type)
     job = {
@@ -193,7 +209,7 @@ def create_job(req: JobRequest,
         "dataset_name": req.dataset_name,
         "dataset_version": req.dataset_version,
         "tenant": req.tenant,
-        "docker_image": req.docker_image,
+        "docker_image": image,
         "config_path": req.config_path,
         "status": "queued",
         "worker": None,
