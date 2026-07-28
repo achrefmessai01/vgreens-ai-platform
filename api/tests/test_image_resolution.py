@@ -64,7 +64,8 @@ def test_training_resolves_latest_image():
     _seed("berry", "v1", "registry.vgreens.lan/vgreens-models/berry:v1", created="2026-01-01T00:00:00+00:00")
     _seed("berry", "v2", "registry.vgreens.lan/vgreens-models/berry:v2", created="2026-02-01T00:00:00+00:00")
     _login()
-    r = client.post("/jobs", json={"job_type": "training", "model_name": "berry", "dataset_name": "demo_berries"})
+    r = client.post("/jobs", json={"job_type": "training", "model_name": "berry",
+                                   "dataset_name": "demo_berries", "dataset_version": "v1"})
     assert r.status_code == 201, r.text
     assert _image_of(r.json()["job_id"]).endswith("berry:v2")   # latest by created_at
 
@@ -81,7 +82,8 @@ def test_processing_resolves_active_image_not_latest():
 def test_explicit_image_wins():
     _login()
     r = client.post("/jobs", json={"job_type": "training", "model_name": "berry",
-                                   "docker_image": "custom/thing:x", "dataset_name": "d"})
+                                   "docker_image": "custom/thing:x", "dataset_name": "d",
+                                   "dataset_version": "v1"})
     assert r.status_code == 201, r.text
     assert _image_of(r.json()["job_id"]) == "custom/thing:x"
 
@@ -89,13 +91,39 @@ def test_explicit_image_wins():
 def test_explicit_model_version_image():
     _login()
     r = client.post("/jobs", json={"job_type": "training", "model_name": "berry",
-                                   "model_version": "v1", "dataset_name": "d"})
+                                   "model_version": "v1", "dataset_name": "d",
+                                   "dataset_version": "v1"})
     assert r.status_code == 201, r.text
     assert _image_of(r.json()["job_id"]).endswith("berry:v1")
 
 
 def test_unresolvable_returns_422():
     _login()
-    r = client.post("/jobs", json={"job_type": "training", "model_name": "brand_new_model"})
+    r = client.post("/jobs", json={"job_type": "training", "model_name": "brand_new_model",
+                                   "dataset_name": "d", "dataset_version": "v1"})
     assert r.status_code == 422, r.text
     assert "docker_image" in r.json()["detail"]
+
+
+def test_training_blank_version_resolves_latest_frozen():
+    # seed two frozen versions; newest by frozen_at wins when the caller omits it
+    import db as _db
+    _db.register_backfill_version("berry", "v1", "/nas/berry/v1",
+                                  {"frozen_at": "2026-01-01T00:00:00+00:00"})
+    _db.register_backfill_version("berry", "v2", "/nas/berry/v2",
+                                  {"frozen_at": "2026-02-01T00:00:00+00:00"})
+    _seed("berry", "v1", "registry.vgreens.lan/vgreens-models/berry:v1")  # image to resolve
+    _login()
+    r = client.post("/jobs", json={"job_type": "training", "model_name": "berry",
+                                   "dataset_name": "berry"})   # NO dataset_version
+    assert r.status_code == 201, r.text
+    job = client.get(f"/jobs/{r.json()['job_id']}").json()
+    assert job["dataset_version"] == "v2"    # latest frozen, resolved server-side
+
+
+def test_training_no_frozen_version_422():
+    _login()
+    r = client.post("/jobs", json={"job_type": "training", "model_name": "berry",
+                                   "dataset_name": "never_frozen_ds"})   # no versions
+    assert r.status_code == 422, r.text
+    assert "frozen version" in r.json()["detail"]

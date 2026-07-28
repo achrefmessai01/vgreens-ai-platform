@@ -187,6 +187,21 @@ def create_job(req: JobRequest,
     if req.gpu_count == 2 and not authn.role_at_least(ident.role, "admin"):
         raise HTTPException(status_code=403,
                             detail="two-GPU training requires admin (jobs:two_gpu)")
+    # A training job resolves a frozen dataset path from name + version. The name
+    # is required; if the version is blank we resolve the LATEST frozen version so
+    # the worker never receives None (which crashed it with a PosixPath/None error).
+    dataset_version = req.dataset_version
+    if req.job_type == "training":
+        if not req.dataset_name:
+            raise HTTPException(status_code=422, detail="training requires a dataset_name")
+        if not dataset_version:
+            versions = db.list_dataset_versions(req.dataset_name)  # newest first
+            if not versions:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"no frozen version found for dataset '{req.dataset_name}' "
+                           f"— import and freeze it first")
+            dataset_version = versions[0]["version"]
     # Resolve the container image. If the caller left it blank, reuse the
     # model's registry image (processing -> active version; training -> latest).
     image = (req.docker_image or "").strip()
@@ -207,7 +222,7 @@ def create_job(req: JobRequest,
         "job_type": req.job_type,
         "model_name": req.model_name,
         "dataset_name": req.dataset_name,
-        "dataset_version": req.dataset_version,
+        "dataset_version": dataset_version,
         "tenant": req.tenant,
         "docker_image": image,
         "config_path": req.config_path,
