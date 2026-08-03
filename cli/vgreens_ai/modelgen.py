@@ -39,6 +39,12 @@ import shutil
 import sys
 from pathlib import Path
 
+# Force MKL's GNU threading layer BEFORE importing torch/ultralytics. The conda
+# base image's Intel MKL otherwise selects MKL_THREADING_LAYER=INTEL, which
+# clashes with libgomp.so.1 in the DDP subprocesses Ultralytics spawns for
+# multi-GPU training and aborts 2-GPU runs. Must precede the first torch import.
+os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+
 import yaml
 from ultralytics import YOLO
 
