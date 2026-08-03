@@ -280,6 +280,11 @@ def _dockerfile(base_model: str) -> str:
 # The 2.4.1 tag drifted to a NumPy-2 build, which breaks torch.from_numpy once
 # ultralytics downgrades numpy to 1.x.
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+# Multi-GPU (DDP) spawns training subprocesses; the conda image's Intel MKL
+# otherwise picks MKL_THREADING_LAYER=INTEL, which clashes with libgomp.so.1
+# (GNU OpenMP) in the child and aborts 2-GPU runs. Force the GNU layer so it
+# matches. Harmless for single-GPU. See torch.distributed / Ultralytics DDP.
+ENV MKL_THREADING_LAYER=GNU
 RUN pip install --no-cache-dir "ultralytics==8.3.0" pyyaml \\
  && pip uninstall -y opencv-python opencv-python-headless >/dev/null 2>&1 || true \\
  && pip install --no-cache-dir "numpy==1.26.4" "opencv-python-headless==4.9.0.80" \\
