@@ -59,7 +59,14 @@ def test_custom_python_skeleton_not_placeholder(tmp_path):
     out = tmp_path / "custom"
     modelgen.generate(s, str(out))
     train = (out / "train.py").read_text()
-    assert "NotImplementedError" in train        # fails until implemented
+    # The custom skeleton is a RUNNABLE reference (honours the /data->/out
+    # contract), not a bare NotImplementedError placeholder.
+    assert "RUNNABLE REFERENCE" in train
+    assert "def main(" in train and "/out" in train
+    # dependency declaration is first-class: a requirements.txt is generated and
+    # the Dockerfile installs it.
+    assert (out / "requirements.txt").exists()
+    assert "pip install --no-cache-dir -r /app/requirements.txt" in (out / "Dockerfile").read_text()
 
 
 def test_unimplemented_preset_raises(tmp_path):

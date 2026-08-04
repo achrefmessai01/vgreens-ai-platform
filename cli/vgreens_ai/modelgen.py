@@ -585,6 +585,10 @@ RUN pip install --no-cache-dir "ultralytics==8.3.0" pyyaml \\
  && pip install --no-cache-dir "numpy==1.26.4" "opencv-python-headless==4.9.0.80" \\
  && python -c "import numpy as np, cv2, torch; a=np.zeros((16,16,3),np.uint8); cv2.warpAffine(a, np.eye(2,3,dtype=np.float32),(16,16)); torch.from_numpy(a); from ultralytics import YOLO; print('env-check OK numpy', np.__version__, 'cv2', cv2.__version__, 'torch', torch.__version__)"
 RUN python -c "from ultralytics import YOLO; YOLO('{base_model}')"
+# Extra dependencies declared in model.yaml (`dependencies:`) or added to
+# requirements.txt by hand — installed on top of the preset's own stack.
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 WORKDIR /app
 COPY train.py process.py entrypoint.py /app/
 ENTRYPOINT ["python", "/app/entrypoint.py"]
@@ -596,9 +600,13 @@ def _dockerfile_custom() -> str:
     # mirror dependency. Swap the base + pip installs for your framework
     # (torch, tensorflow, scikit-learn, ...) when you implement a real model.
     return """\
-# Lightweight custom-model image. The runnable reference needs only PyYAML.
+# Lightweight custom-model image. The runnable reference needs only PyYAML;
+# your model's own libraries (torch, tensorflow, timm, scikit-learn, ...) are
+# declared in model.yaml (`dependencies:`) or requirements.txt and installed here.
 FROM python:3.11-slim
 RUN pip install --no-cache-dir pyyaml
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 WORKDIR /app
 COPY train.py process.py entrypoint.py /app/
 ENTRYPOINT ["python", "/app/entrypoint.py"]
@@ -619,6 +627,10 @@ FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 ENV MKL_THREADING_LAYER=GNU
 RUN pip install --no-cache-dir rfdetr supervision pyyaml
 RUN python -c "import rfdetr, supervision, torch; print('env-check OK rfdetr', torch.__version__)"
+# Extra dependencies declared in model.yaml (`dependencies:`) or added to
+# requirements.txt by hand — installed on top of the preset's own stack.
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 WORKDIR /app
 COPY train.py process.py entrypoint.py /app/
 ENTRYPOINT ["python", "/app/entrypoint.py"]
@@ -699,7 +711,35 @@ vgreens-ai job train --model {m['name']} --dataset {ds['name']}:{ds.get('version
 vgreens-ai model show {m['name']}
 vgreens-ai model promote {m['name']} <version>
 ```
+
+## Dependencies
+
+Extra Python packages this model needs (e.g. a custom CNN's `torch`, `timm`,
+`scikit-learn`) are declared once in `model.yaml` under `dependencies:` and
+generated into `requirements.txt`, which the image installs at build time — no
+need to hand-edit the Dockerfile. You can also add pip lines to
+`requirements.txt` directly.
 """
+
+
+def _requirements_txt(spec: dict) -> str:
+    """Generate requirements.txt from the spec's optional `dependencies:` list.
+
+    Extra Python packages the model needs (e.g. a custom CNN's torch/timm) are
+    declared once in model.yaml and installed into the image at build time, so
+    the user never has to hand-edit the Dockerfile. The file is always emitted
+    (empty except for a header when no dependencies are declared) so the
+    Dockerfile's `pip install -r requirements.txt` layer is preset-independent.
+    """
+    deps = spec.get("dependencies") or []
+    header = (
+        "# Extra Python dependencies for this model, installed into the image at\n"
+        "# build time on top of the preset's own stack. Declared in model.yaml\n"
+        "# under `dependencies:`; you may also add pip requirement lines by hand.\n"
+    )
+    lines = [str(d).strip() for d in deps if str(d).strip()]
+    body = ("\n".join(lines) + "\n") if lines else ""
+    return header + body
 
 
 def _render_ultra(spec: dict) -> dict:
@@ -711,6 +751,7 @@ def _render_ultra(spec: dict) -> dict:
         "train.py": _TRAIN_PY,
         "process.py": _PROCESS_PY,
         "Dockerfile": _dockerfile(base),
+        "requirements.txt": _requirements_txt(spec),
         f"configs/{m}.yaml": _config_yaml(spec),
         ".gitlab-ci.yml": _gitlab_ci(spec),
         "tests/test_contract.py": _CONTRACT_TEST,
@@ -727,6 +768,7 @@ def _render_rfdetr(spec: dict) -> dict:
         "train.py": _RFDETR_TRAIN,
         "process.py": _RFDETR_PROCESS,
         "Dockerfile": _dockerfile_rfdetr(),
+        "requirements.txt": _requirements_txt(spec),
         f"configs/{m}.yaml": _config_yaml(spec),
         ".gitlab-ci.yml": _gitlab_ci(spec),
         "tests/test_contract.py": _CONTRACT_TEST,
@@ -742,6 +784,7 @@ def _render_custom(spec: dict) -> dict:
         "train.py": _CUSTOM_TRAIN,
         "process.py": _CUSTOM_PROCESS,
         "Dockerfile": _dockerfile_custom(),
+        "requirements.txt": _requirements_txt(spec),
         f"configs/{m}.yaml": _config_yaml(spec),
         ".gitlab-ci.yml": _gitlab_ci(spec),
         "tests/test_contract.py": _CONTRACT_TEST,

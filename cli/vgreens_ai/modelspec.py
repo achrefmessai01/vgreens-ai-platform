@@ -85,6 +85,15 @@ def validate(spec: Any) -> list[str]:
     repo = spec.get("repository") or {}
     _req(errors, bool(repo.get("name")), "repository.name is required")
 
+    # Optional extra Python dependencies installed into the model image at build
+    # time (a requirements.txt is generated from this list). Must be a list of
+    # non-empty pip requirement strings when present.
+    deps = spec.get("dependencies")
+    if deps is not None:
+        if not isinstance(deps, list) or not all(
+                isinstance(d, str) and d.strip() for d in deps):
+            errors.append("dependencies must be a list of non-empty pip requirement strings")
+
     return errors
 
 
