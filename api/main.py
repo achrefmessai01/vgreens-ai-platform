@@ -35,7 +35,11 @@ import db
 import broker as jobqueue
 import models_registry as reg
 import authn
+import notify
 from auth import require_token
+
+# Base URL used for deep-links inside notification emails.
+WEB_BASE_URL = os.environ.get("WEB_BASE_URL", "https://app.vgreens.lan:9443")
 
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
 MAX_FAILED_LOGINS = int(os.environ.get("MAX_FAILED_LOGINS", "10"))
@@ -158,6 +162,62 @@ def _new_job_id(job_type: str) -> str:
     prefix = "trn" if job_type == "training" else "prc"
     day = datetime.now(timezone.utc).strftime("%Y%m%d")
     return f"{prefix}_{day}_{secrets.token_hex(2)}"
+
+
+def _requester_email(username: Optional[str]) -> Optional[str]:
+    """Email of the user who requested a job (best-effort; None if unknown)."""
+    if not username:
+        return None
+    try:
+        user = db.get_user_by_username(username)
+        return (user or {}).get("email") or None
+    except Exception:  # noqa: BLE001 - notifications must never break the request
+        return None
+
+
+def _model_owner_email(model_name: str) -> Optional[str]:
+    """Best-effort owner email for a model, for notifications.
+
+    Source of truth is the published job-config on the NAS
+    (<NAS_JOB_CONFIGS_ROOT>/<model>.yaml `owner`), which `vgreens-ai config
+    publish` writes. Falls back to the model's latest registry version
+    metadata.json `owner`. Returns None if nothing usable is found."""
+    try:
+        cfg = Path(NAS_JOB_CONFIGS_ROOT) / f"{model_name}.yaml"
+        if cfg.is_file():
+            owner = None
+            try:
+                import yaml
+                doc = yaml.safe_load(cfg.read_text())
+                if isinstance(doc, dict):
+                    owner = doc.get("owner")
+            except ModuleNotFoundError:
+                # yaml not in the API venv — cheap line scan for `owner: <addr>`
+                for line in cfg.read_text().splitlines():
+                    if line.strip().startswith("owner:"):
+                        owner = line.split(":", 1)[1].strip().strip("'\"")
+                        break
+            if isinstance(owner, str) and notify.valid_email(owner.strip()):
+                return owner.strip()
+        # fall back to the latest registry version's metadata owner
+        lv = reg.latest_version(model_name)
+        if lv:
+            v = reg.get_version(model_name, lv) or {}
+            owner = (v.get("metadata") or {}).get("owner")
+            if isinstance(owner, str) and notify.valid_email(owner.strip()):
+                return owner.strip()
+    except Exception:  # noqa: BLE001 - notifications must never break the request
+        return None
+    return None
+
+
+def _active_admin_emails() -> list[str]:
+    """Emails of active admins (for the licence-approval alert). Best-effort."""
+    try:
+        return [u["email"] for u in db.list_users()
+                if u.get("role") == "admin" and u.get("active") and u.get("email")]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _write_nas_snapshot(job: dict) -> str:
@@ -445,6 +505,23 @@ def report_status(job_id: str, upd: StatusUpdate, _: str = Depends(authn.actor("
         output_path=upd.output_path,
         result_version=upd.result_version,
     )
+    # Fire-and-forget: notify the model owner + requester when a job finishes.
+    # (Model onboarding itself runs via the CLI/GitLab, not this API; the first
+    # training-job success email is what tells the owner "your model trained".)
+    if upd.status in ("succeeded", "failed", "cancelled"):
+        try:
+            job = db.get_job(job_id) or {}
+            owner_email = _model_owner_email(job.get("model_name"))
+            requester_email = _requester_email(job.get("requested_by"))
+            notify.send_email(
+                notify.recipients_for_job(
+                    job, requester_email, owner_email,
+                    os.environ.get("NOTIFY_DEFAULT")),
+                notify.job_subject(job),
+                notify.job_body(job, WEB_BASE_URL),
+            )
+        except Exception:  # noqa: BLE001 - never break the worker callback
+            pass
     return {"job_id": job_id, "status": upd.status}
 
 
@@ -506,6 +583,17 @@ def promote_model(model: str, body: PromoteBody, who: str = Depends(authn.actor(
     except reg.RegistryError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     db.add_audit(who, "model.promote", f"{model}:{body.version}", reason=body.reason, source="api")
+    try:  # fire-and-forget: tell the model owner + acting admin
+        notify.send_email(
+            notify.recipients_for_job(
+                {}, _requester_email(who), _model_owner_email(model),
+                os.environ.get("NOTIFY_DEFAULT")),
+            notify.model_subject("promoted", model, res.get("active_version")),
+            notify.model_body("promoted", model, res.get("active_version"), who,
+                              WEB_BASE_URL, reason=body.reason),
+        )
+    except Exception:  # noqa: BLE001
+        pass
     return res
 
 
@@ -517,6 +605,17 @@ def rollback_model(model: str, body: RollbackBody, who: str = Depends(authn.acto
         raise HTTPException(status_code=409, detail=str(exc))
     db.add_audit(who, "model.rollback", f"{model}:{res.get('active_version')}",
                  reason=body.reason, source="api")
+    try:  # fire-and-forget: tell the model owner + acting admin
+        notify.send_email(
+            notify.recipients_for_job(
+                {}, _requester_email(who), _model_owner_email(model),
+                os.environ.get("NOTIFY_DEFAULT")),
+            notify.model_subject("rolled back", model, res.get("active_version")),
+            notify.model_body("rolled back", model, res.get("active_version"), who,
+                              WEB_BASE_URL, reason=body.reason),
+        )
+    except Exception:  # noqa: BLE001
+        pass
     return res
 
 
@@ -984,6 +1083,18 @@ def report_dataset_state(import_id: str, upd: DatasetStateUpdate,
         import_id, upd.state,
         detail=upd.detail, error=upd.error, resolved_version=upd.resolved_version,
     )
+    # Fire-and-forget: a dataset import needs a human licence-approval decision.
+    if ok and upd.state == "awaiting_license_approval":
+        try:
+            fresh = db.get_dataset_import(import_id) or imp
+            notify.send_email(
+                notify.recipients_for_dataset_licence(
+                    _active_admin_emails(), os.environ.get("NOTIFY_DEFAULT")),
+                notify.dataset_subject(fresh),
+                notify.dataset_body(fresh, WEB_BASE_URL),
+            )
+        except Exception:  # noqa: BLE001 - never break the worker callback
+            pass
     return {"import_id": import_id, "state": upd.state if ok else imp["state"], "updated": ok}
 
 
