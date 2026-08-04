@@ -161,6 +161,295 @@ if __name__ == "__main__":
     sys.exit(main())
 '''
 
+_RFDETR_TRAIN = '''\
+# NOTE: validate on a GPU host before first production use — metrics extraction
+# (supervision mAP) and the EMA checkpoint filename are best-effort and may need
+# a one-line adjustment after the first real run.
+"""RF-DETR detection training — platform contract entrypoint (Apache-2.0).
+
+reads  /data (ro), /config/job.yaml ; writes /out/model.pt, /out/eval/metrics.json,
+/out/evaluation_report.md ; exit 0 on success. /data is copied to a writable dir
+because RF-DETR writes caches next to the labels. RF-DETR reads YOLO-format
+datasets directly via dataset_file="yolo" (no COCO conversion). batch_size and
+grad_accum_steps are native params; effective batch = batch_size x grad_accum_steps.
+"""
+import json
+import math
+import os
+import shutil
+import sys
+from pathlib import Path
+
+# Force MKL's GNU threading layer BEFORE importing torch/rfdetr. The conda base
+# image's Intel MKL otherwise selects MKL_THREADING_LAYER=INTEL, which clashes
+# with libgomp.so.1 in the DDP subprocesses spawned for multi-GPU training and
+# aborts multi-GPU runs. Must precede the first torch import.
+os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+
+import yaml
+
+OUT = Path("/out")
+CONFIG = Path("/config/job.yaml")
+WORK = Path("/tmp/ds")
+
+# model_variant -> RF-DETR class name
+_VARIANTS = {
+    "base": "RFDETRBase",
+    "nano": "RFDETRNano",
+    "small": "RFDETRSmall",
+    "medium": "RFDETRMedium",
+    "large": "RFDETRLarge",
+}
+
+
+def _model_class(variant):
+    import rfdetr
+    name = _VARIANTS.get(str(variant).lower(), "RFDETRBase")
+    return getattr(rfdetr, name, rfdetr.RFDETRBase)
+
+
+def _yolo_ground_truth(label_path, w, h):
+    """Build an sv.Detections from a YOLO label file (normalized cx cy bw bh)."""
+    import numpy as np
+    import supervision as sv
+    boxes, classes = [], []
+    if label_path.is_file():
+        for line in label_path.read_text().splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            c, cx, cy, bw, bh = parts[:5]
+            cx, cy, bw, bh = float(cx) * w, float(cy) * h, float(bw) * w, float(bh) * h
+            boxes.append([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2])
+            classes.append(int(float(c)))
+    if not boxes:
+        return sv.Detections.empty()
+    return sv.Detections(xyxy=np.array(boxes, dtype=float),
+                         class_id=np.array(classes, dtype=int))
+
+
+def _compute_metrics(ckpt, ds_root, variant):
+    """Best-effort mAP over the val split using RF-DETR + supervision.
+
+    Returns a dict with mAP50/mAP50-95. On any failure returns zeros plus a note
+    (this path can only be exercised on a GPU host) so the pipeline still writes a
+    valid metrics.json.
+    """
+    try:
+        import supervision as sv
+        from supervision.metrics import MeanAveragePrecision
+        from PIL import Image
+
+        cls = _model_class(variant)
+        model = cls(pretrain_weights=str(ckpt))
+
+        val_dir = None
+        for cand in ("valid/images", "val/images", "validation/images"):
+            if (ds_root / cand).is_dir():
+                val_dir = ds_root / cand
+                break
+        if val_dir is None:
+            return {"mAP50": 0.0, "mAP50-95": 0.0,
+                    "note": "no val split found — validate metrics on a GPU host"}
+
+        labels_dir = val_dir.parent / "labels"
+        images = sorted(p for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.PNG")
+                        for p in val_dir.glob(ext))
+        preds, targets = [], []
+        for img_path in images:
+            image = Image.open(img_path).convert("RGB")
+            w, h = image.size
+            preds.append(model.predict(image, threshold=0.5))
+            targets.append(_yolo_ground_truth(labels_dir / (img_path.stem + ".txt"), w, h))
+
+        metric = MeanAveragePrecision()
+        metric.update(preds, targets)
+        result = metric.compute()
+        return {"mAP50": round(float(result.map50), 4),
+                "mAP50-95": round(float(result.map50_95), 4)}
+    except Exception as exc:  # best-effort: never crash the run on metrics
+        sys.stderr.write(f"[train] metrics extraction failed (best-effort): {exc}\\n")
+        return {"mAP50": 0.0, "mAP50-95": 0.0,
+                "note": f"metrics extraction failed on this host: {exc}"}
+
+
+def main() -> int:
+    (OUT / "eval").mkdir(parents=True, exist_ok=True)
+    cfg = yaml.safe_load(CONFIG.read_text()) if CONFIG.is_file() else {}
+    t = (cfg or {}).get("train", {})
+
+    variant = t.get("model_variant", "base")
+    epochs = int(t.get("epochs", 10))
+    image_size = int(t.get("image_size", t.get("imgsz", 512)))
+    batch_size = int(t.get("batch_size", t.get("batch", 4)))
+
+    # grad-accum: explicit steps win; else derive from effective_batch; else 4.
+    gas = t.get("grad_accum_steps", t.get("grad_accumulation_steps"))
+    eff = t.get("effective_batch")
+    if gas:
+        grad_accum = max(1, int(gas))
+    elif eff:
+        grad_accum = max(1, math.ceil(int(eff) / max(1, batch_size)))
+    else:
+        grad_accum = 4
+    effective = batch_size * grad_accum
+
+    if WORK.exists():
+        shutil.rmtree(WORK)
+    shutil.copytree("/data", WORK)
+
+    print(f"[train] variant={variant} epochs={epochs} image_size={image_size} "
+          f"batch_size={batch_size} grad_accum_steps={grad_accum} "
+          f"effective_batch={effective}", flush=True)
+
+    import torch  # noqa: F401  (imported after MKL env is set)
+    cls = _model_class(variant)
+    model = cls()
+
+    try:
+        model.train(dataset_dir=str(WORK), dataset_file="yolo", epochs=epochs,
+                    batch_size=batch_size, grad_accum_steps=grad_accum,
+                    lr=1e-4, output_dir=str(OUT / "runs"), early_stopping=True)
+    except Exception as exc:
+        oom = isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ()))
+        if not oom and isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower():
+            oom = True
+        if oom:
+            sys.stderr.write(
+                "[train] training ran out of GPU memory (VRAM): reduce "
+                "training.batch_size or training.image_size, or lower effective "
+                "batch; effective batch = batch_size x grad_accum_steps "
+                f"(was {batch_size} x {grad_accum} = {effective})\\n")
+            return 2
+        raise
+
+    # Pick the produced checkpoint: prefer an EMA/best *.pth (the smoothed one),
+    # else the newest .pth. Filename may need a one-line tweak after the first run.
+    ckpts = sorted((OUT / "runs").rglob("*.pth"), key=lambda p: p.stat().st_mtime)
+    if not ckpts:
+        sys.stderr.write("[train] no .pth checkpoint produced under /out/runs\\n")
+        return 1
+    ema = [p for p in ckpts if "ema" in p.name.lower()]
+    best = [p for p in ckpts if "best" in p.name.lower()]
+    chosen = (ema or best or ckpts)[-1]
+    shutil.copyfile(chosen, OUT / "model.pt")
+    print(f"[train] selected checkpoint: {chosen.name}", flush=True)
+
+    m = _compute_metrics(chosen, WORK, variant)
+    (OUT / "eval" / "metrics.json").write_text(json.dumps(m, indent=2))
+
+    lines = [f"# {os.environ.get('MODEL_NAME', 'model')} — evaluation\\n",
+             f"- variant: {variant}  epochs: {epochs}  image_size: {image_size}",
+             f"- batch_size: {batch_size}  grad_accum_steps: {grad_accum}  "
+             f"effective_batch: {effective}",
+             f"- mAP@0.5: {m.get('mAP50')}",
+             f"- mAP@0.5:0.95: {m.get('mAP50-95')}"]
+    if m.get("note"):
+        lines.append(f"- note: {m['note']}")
+    (OUT / "evaluation_report.md").write_text("\\n".join(lines) + "\\n")
+    print(f"[train] done: {m}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+_RFDETR_PROCESS = '''\
+"""RF-DETR processing/inference — serves the ACTIVE promoted model (/model/model.pt).
+
+reads /data (images) + /config/job.yaml ; writes /out/report.json with images,
+total_detections, by_class (class name -> count), conf_threshold ; exit 0.
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
+
+OUT = Path("/out")
+DATA = Path("/data")
+MODEL = Path("/model/model.pt")
+CONFIG = Path("/config/job.yaml")
+
+_VARIANTS = {
+    "base": "RFDETRBase",
+    "nano": "RFDETRNano",
+    "small": "RFDETRSmall",
+    "medium": "RFDETRMedium",
+    "large": "RFDETRLarge",
+}
+
+
+def _model_class(variant):
+    import rfdetr
+    name = _VARIANTS.get(str(variant).lower(), "RFDETRBase")
+    return getattr(rfdetr, name, rfdetr.RFDETRBase)
+
+
+def main() -> int:
+    OUT.mkdir(parents=True, exist_ok=True)
+    if not MODEL.is_file():
+        sys.stderr.write("no model at /model/model.pt — is a version promoted?\\n")
+        return 1
+
+    cfg = {}
+    if yaml and CONFIG.is_file():
+        cfg = yaml.safe_load(CONFIG.read_text()) or {}
+    conf = float((cfg.get("process") or {}).get("confidence_threshold",
+                 (cfg.get("process") or {}).get("conf", 0.25)))
+    variant = (cfg.get("process") or {}).get("model_variant",
+              (cfg.get("train") or {}).get("model_variant", "base"))
+
+    images = sorted(p for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.PNG")
+                    for p in DATA.rglob(ext))
+    if not images:
+        sys.stderr.write("no images under /data\\n")
+        return 1
+
+    from PIL import Image
+    cls = _model_class(variant)
+    model = cls(pretrain_weights=str(MODEL))
+    names = getattr(model, "class_names", None)
+
+    per_class, total = {}, 0
+    for img_path in images:
+        image = Image.open(img_path).convert("RGB")
+        det = model.predict(image, threshold=conf)
+        class_ids = getattr(det, "class_id", None)
+        if class_ids is None:
+            continue
+        total += len(class_ids)
+        for c in class_ids.tolist() if hasattr(class_ids, "tolist") else list(class_ids):
+            per_class[int(c)] = per_class.get(int(c), 0) + 1
+
+    def _name(k):
+        if isinstance(names, dict):
+            return names.get(k, str(k))
+        if isinstance(names, (list, tuple)) and 0 <= k < len(names):
+            return names[k]
+        return str(k)
+
+    report = {"model": os.environ.get("MODEL_NAME", ""),
+              "model_version": os.environ.get("MODEL_VERSION", ""),
+              "images": len(images), "total_detections": total,
+              "by_class": {_name(k): v for k, v in sorted(per_class.items())},
+              "conf_threshold": conf}
+    (OUT / "report.json").write_text(json.dumps(report, indent=2))
+    print(f"[process] done: {report}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
 _CONTRACT_TEST = '''\
 """CPU-only contract checks for CI (no GPU, no platform)."""
 import py_compile
@@ -316,18 +605,51 @@ ENTRYPOINT ["python", "/app/entrypoint.py"]
 """
 
 
+def _dockerfile_rfdetr() -> str:
+    # RF-DETR (Apache-2.0) detection image. Same PyTorch CUDA base as the legacy
+    # ultralytics image (proven on this host). No yolo prefetch — RF-DETR reads
+    # our YOLO datasets directly at train time via dataset_file="yolo".
+    return """\
+# RF-DETR (Apache-2.0) detection image. PyTorch CUDA base proven on this host.
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+# Multi-GPU (DDP) spawns training subprocesses; the conda image's Intel MKL
+# otherwise picks MKL_THREADING_LAYER=INTEL, which clashes with libgomp.so.1
+# (GNU OpenMP) in the child and aborts multi-GPU runs. Force the GNU layer so it
+# matches. Harmless for single-GPU. See torch.distributed / DDP.
+ENV MKL_THREADING_LAYER=GNU
+RUN pip install --no-cache-dir rfdetr supervision pyyaml
+RUN python -c "import rfdetr, supervision, torch; print('env-check OK rfdetr', torch.__version__)"
+WORKDIR /app
+COPY train.py process.py entrypoint.py /app/
+ENTRYPOINT ["python", "/app/entrypoint.py"]
+"""
+
+
 def _config_yaml(spec: dict) -> str:
     import yaml
     t = spec.get("training", {})
     v = spec.get("validation", {})
     p = spec.get("processing", {})
+    train = {"model": t.get("base_model", "yolo11n.pt"),
+             "epochs": t.get("epochs", 50), "imgsz": t.get("image_size", 640),
+             "batch": t.get("batch_size", 16) if isinstance(t.get("batch_size"), int) else 16}
+    # Pass through RF-DETR native batching controls + variant when present so the
+    # generated train.py can read them from /config/job.yaml.
+    if t.get("model_variant"):
+        train["model_variant"] = t["model_variant"]
+    if isinstance(t.get("image_size"), int):
+        train["image_size"] = t["image_size"]
+    if isinstance(t.get("batch_size"), int):
+        train["batch_size"] = t["batch_size"]
+    for key in ("grad_accum_steps", "grad_accumulation_steps", "effective_batch"):
+        if isinstance(t.get(key), int):
+            train[key] = t[key]
     doc = {
-        "train": {"model": t.get("base_model", "yolo11n.pt"),
-                  "epochs": t.get("epochs", 50), "imgsz": t.get("image_size", 640),
-                  "batch": t.get("batch_size", 16) if isinstance(t.get("batch_size"), int) else 16},
+        "train": train,
         "thresholds": {k: val for k, val in (v.get("thresholds") or {}).items()},
         "thresholds_max": v.get("thresholds_max", {}),
-        "process": {"conf": p.get("confidence_threshold", 0.25)},
+        "process": {"conf": p.get("confidence_threshold", 0.25),
+                    "confidence_threshold": p.get("confidence_threshold", 0.25)},
     }
     return yaml.safe_dump(doc, sort_keys=False)
 
@@ -397,6 +719,22 @@ def _render_ultra(spec: dict) -> dict:
     }
 
 
+def _render_rfdetr(spec: dict) -> dict:
+    m = spec["model"]["name"]
+    preset = spec["template"]["preset"]
+    return {
+        "entrypoint.py": _ENTRYPOINT_PY,
+        "train.py": _RFDETR_TRAIN,
+        "process.py": _RFDETR_PROCESS,
+        "Dockerfile": _dockerfile_rfdetr(),
+        f"configs/{m}.yaml": _config_yaml(spec),
+        ".gitlab-ci.yml": _gitlab_ci(spec),
+        "tests/test_contract.py": _CONTRACT_TEST,
+        "README.md": _readme(spec, preset),
+        ".gitignore": _GITIGNORE,
+    }
+
+
 def _render_custom(spec: dict) -> dict:
     m = spec["model"]["name"]
     return {
@@ -414,12 +752,20 @@ def _render_custom(spec: dict) -> dict:
 
 def render(spec: dict) -> dict:
     preset = (spec.get("template") or {}).get("preset")
+    if preset == "rfdetr_detection":
+        return _render_rfdetr(spec)
     if preset in ("ultralytics_detection",):
         return _render_ultra(spec)
     if preset == "custom_python":
         return _render_custom(spec)
+    # rfdetr_segmentation / cnn_classification are declared presets but not yet
+    # implemented as real working code — emit the runnable custom scaffold so
+    # onboarding stays green; the engineer fills in the marked sections.
+    if preset in ("rfdetr_segmentation", "cnn_classification"):
+        return _render_custom(spec)
     raise ValueError(f"generator for preset '{preset}' is not implemented yet "
-                     "(available: ultralytics_detection, custom_python)")
+                     "(available: rfdetr_detection, rfdetr_segmentation, "
+                     "cnn_classification, ultralytics_detection, custom_python)")
 
 
 def generate(spec: Any, out_dir: str, dry_run: bool = False, force: bool = False) -> list[str]:

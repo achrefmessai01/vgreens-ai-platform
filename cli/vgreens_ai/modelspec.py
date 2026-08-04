@@ -14,7 +14,17 @@ TASKS = ("object_detection", "classification", "segmentation", "custom")
 GPU_COUNTS = (1, 2)
 
 # preset -> {task it implements, whether it generates working code}
+#
+# NOTE: the `ultralytics_*` presets are LEGACY. Ultralytics is AGPL-3.0, which is
+# commercially risky for a proprietary platform. They are kept only so previously
+# generated specs still validate. Prefer the `rfdetr_*` presets (RF-DETR is
+# Apache-2.0) for new detection models.
 PRESETS: dict[str, dict] = {
+    # --- preferred: RF-DETR (Apache-2.0) ---
+    "rfdetr_detection": {"task": "object_detection", "generates_working_code": True},
+    "rfdetr_segmentation": {"task": "segmentation", "generates_working_code": False},
+    "cnn_classification": {"task": "classification", "generates_working_code": False},
+    # --- legacy: Ultralytics (AGPL-3.0, commercially risky) ---
     "ultralytics_detection": {"task": "object_detection", "generates_working_code": True},
     "ultralytics_classification": {"task": "classification", "generates_working_code": True},
     "ultralytics_segmentation": {"task": "segmentation", "generates_working_code": True},
@@ -62,6 +72,15 @@ def validate(spec: Any) -> list[str]:
     training = spec.get("training") or {}
     gpu = training.get("gpu_count", 1)
     _req(errors, gpu in GPU_COUNTS, f"training.gpu_count must be one of {GPU_COUNTS}")
+
+    # Optional batching controls (RF-DETR native batch / grad-accumulation). Not
+    # required; when present each must be a positive int. effective_batch =
+    # batch_size x grad_accumulation_steps.
+    for key in ("batch_size", "grad_accumulation_steps", "effective_batch"):
+        if key in training and training[key] is not None:
+            val = training[key]
+            _req(errors, isinstance(val, int) and not isinstance(val, bool) and val > 0,
+                 f"training.{key} must be a positive integer")
 
     repo = spec.get("repository") or {}
     _req(errors, bool(repo.get("name")), "repository.name is required")
