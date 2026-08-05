@@ -36,6 +36,7 @@ because ultralytics writes a label cache next to the labels.
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -98,6 +99,8 @@ def main() -> int:
         f"- epochs: {epochs} imgsz: {imgsz} batch: {batch}\\n\\n"
         f"- mAP@0.5: {m['mAP50']}\\n- mAP@0.5:0.95: {m['mAP50-95']}\\n"
         f"- precision: {m['precision']}\\n- recall: {m['recall']}\\n")
+    # Container runs as root; relax /out so the non-root worker can copy it to NAS.
+    subprocess.run(["chmod", "-R", "a+rwX", "/out"], check=False)
     print(f"[train] done: {m}", flush=True)
     return 0
 
@@ -177,6 +180,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -346,6 +350,10 @@ def main() -> int:
     if m.get("note"):
         lines.append(f"- note: {m['note']}")
     (OUT / "evaluation_report.md").write_text("\\n".join(lines) + "\\n")
+    # The container runs as root; RF-DETR/Lightning checkpoints can be written
+    # with restrictive perms that block the non-root worker from copying /out to
+    # the NAS. Relax /out so every artefact is readable/traversable by the worker.
+    subprocess.run(["chmod", "-R", "a+rwX", "/out"], check=False)
     print(f"[train] done: {m}", flush=True)
     return 0
 
@@ -481,6 +489,7 @@ your real model + training loop (any framework).
 """
 import json
 import pickle
+import subprocess
 import sys
 from pathlib import Path
 
@@ -508,6 +517,8 @@ def main() -> int:
     # metric keys here must include whatever you set under `thresholds` in the config
     (OUT / "eval" / "metrics.json").write_text(
         json.dumps({"accuracy": round(float(accuracy), 4)}, indent=2))
+    # Container runs as root; relax /out so the non-root worker can copy it to NAS.
+    subprocess.run(["chmod", "-R", "a+rwX", "/out"], check=False)
     print(f"[train] wrote model.pt + metrics.json (accuracy={accuracy})", flush=True)
     return 0
 
