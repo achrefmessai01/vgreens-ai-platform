@@ -617,10 +617,11 @@ def _dockerfile_rfdetr() -> str:
     # ultralytics image (proven on this host). No yolo prefetch — RF-DETR reads
     # our YOLO datasets directly at train time via dataset_file="yolo".
     return """\
-# RF-DETR (Apache-2.0) detection image. RF-DETR pulls transformers>=5.1, which
-# requires PyTorch >= 2.4 — so this image uses a torch-2.4 base (NOT the 2.3.1
-# base the ultralytics image needs for its numpy<2 pin; RF-DETR has no such cap).
-FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
+# RF-DETR (Apache-2.0) detection image. RF-DETR pulls transformers 5.x, which
+# imports torch.distributed.tensor.DTensor — only present in PyTorch >= 2.5 — so
+# this image uses a torch-2.5 base (NOT the 2.3.1 base the ultralytics image needs
+# for its numpy<2 pin; RF-DETR has no such cap and works with numpy 2).
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 # Multi-GPU (DDP) spawns training subprocesses; the conda image's Intel MKL
 # otherwise picks MKL_THREADING_LAYER=INTEL, which clashes with libgomp.so.1
 # (GNU OpenMP) in the child and aborts multi-GPU runs. Force the GNU layer so it
