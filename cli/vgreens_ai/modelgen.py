@@ -627,7 +627,13 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 # (GNU OpenMP) in the child and aborts multi-GPU runs. Force the GNU layer so it
 # matches. Harmless for single-GPU. See torch.distributed / DDP.
 ENV MKL_THREADING_LAYER=GNU
-RUN pip install --no-cache-dir rfdetr supervision pyyaml
+# Pin the whole RF-DETR stack to a known-consistent set. Unpinned, pip pulls the
+# newest transformers, which outran the torch base (transformers 5.x needs
+# torch.distributed.tensor.DTensor -> torch>=2.5). These versions are proven to
+# resolve together on the 2.5.1 base; torch/torchvision come from the base image.
+RUN pip install --no-cache-dir "rfdetr==1.9.1" "transformers==5.14.1" "supervision==0.30.0" pyyaml
+# Build-time self-check: importing rfdetr exercises the torch/transformers ABI, so
+# a mismatched combo fails the BUILD here rather than a GPU run.
 RUN python -c "import rfdetr, supervision, torch; print('env-check OK rfdetr', torch.__version__)"
 # Extra dependencies declared in model.yaml (`dependencies:`) or added to
 # requirements.txt by hand — installed on top of the preset's own stack.
