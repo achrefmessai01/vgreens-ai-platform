@@ -236,9 +236,8 @@ def _compute_metrics(ckpt, ds_root, variant):
     valid metrics.json.
     """
     try:
-        import supervision as sv
-        from supervision.metrics import MeanAveragePrecision
         from PIL import Image
+        from supervision.metrics import MeanAveragePrecision
 
         cls = _model_class(variant)
         model = cls(pretrain_weights=str(ckpt))
@@ -267,7 +266,7 @@ def _compute_metrics(ckpt, ds_root, variant):
         result = metric.compute()
         return {"mAP50": round(float(result.map50), 4),
                 "mAP50-95": round(float(result.map50_95), 4)}
-    except Exception as exc:  # best-effort: never crash the run on metrics
+    except Exception as exc:  # noqa: BLE001 -- best-effort: never crash on metrics
         sys.stderr.write(f"[train] metrics extraction failed (best-effort): {exc}\\n")
         return {"mAP50": 0.0, "mAP50-95": 0.0,
                 "note": f"metrics extraction failed on this host: {exc}"}
@@ -302,7 +301,7 @@ def main() -> int:
           f"batch_size={batch_size} grad_accum_steps={grad_accum} "
           f"effective_batch={effective}", flush=True)
 
-    import torch  # noqa: F401  (imported after MKL env is set)
+    import torch  # imported here, after the MKL env var is set above
     cls = _model_class(variant)
     model = cls()
 
@@ -340,8 +339,8 @@ def main() -> int:
 
     lines = [f"# {os.environ.get('MODEL_NAME', 'model')} — evaluation\\n",
              f"- variant: {variant}  epochs: {epochs}  image_size: {image_size}",
-             f"- batch_size: {batch_size}  grad_accum_steps: {grad_accum}  "
-             f"effective_batch: {effective}",
+             (f"- batch_size: {batch_size}  grad_accum_steps: {grad_accum}  "
+              f"effective_batch: {effective}"),
              f"- mAP@0.5: {m.get('mAP50')}",
              f"- mAP@0.5:0.95: {m.get('mAP50-95')}"]
     if m.get("note"):
@@ -618,8 +617,10 @@ def _dockerfile_rfdetr() -> str:
     # ultralytics image (proven on this host). No yolo prefetch — RF-DETR reads
     # our YOLO datasets directly at train time via dataset_file="yolo".
     return """\
-# RF-DETR (Apache-2.0) detection image. PyTorch CUDA base proven on this host.
-FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+# RF-DETR (Apache-2.0) detection image. RF-DETR pulls transformers>=5.1, which
+# requires PyTorch >= 2.4 — so this image uses a torch-2.4 base (NOT the 2.3.1
+# base the ultralytics image needs for its numpy<2 pin; RF-DETR has no such cap).
+FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
 # Multi-GPU (DDP) spawns training subprocesses; the conda image's Intel MKL
 # otherwise picks MKL_THREADING_LAYER=INTEL, which clashes with libgomp.so.1
 # (GNU OpenMP) in the child and aborts multi-GPU runs. Force the GNU layer so it
