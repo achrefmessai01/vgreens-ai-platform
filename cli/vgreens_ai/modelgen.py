@@ -631,10 +631,14 @@ ENV MKL_THREADING_LAYER=GNU
 # newest transformers, which outran the torch base (transformers 5.x needs
 # torch.distributed.tensor.DTensor -> torch>=2.5). These versions are proven to
 # resolve together on the 2.5.1 base; torch/torchvision come from the base image.
-RUN pip install --no-cache-dir "rfdetr==1.9.1" "transformers==5.14.1" "supervision==0.30.0" pyyaml
-# Build-time self-check: importing rfdetr exercises the torch/transformers ABI, so
-# a mismatched combo fails the BUILD here rather than a GPU run.
-RUN python -c "import rfdetr, supervision, torch; print('env-check OK rfdetr', torch.__version__)"
+# The [train,loggers] extra pulls the training deps (pytorch_lightning, etc.);
+# a plain `pip install rfdetr` gives only inference deps and training aborts with
+# "RF-DETR training dependencies are missing".
+RUN pip install --no-cache-dir "rfdetr[train,loggers]==1.9.1" "transformers==5.14.1" "supervision==0.30.0" pyyaml
+# Build-time self-check: importing rfdetr + a training dep exercises the
+# torch/transformers/lightning ABI, so a mismatched or missing combo fails the
+# BUILD here rather than a GPU run.
+RUN python -c "import rfdetr, supervision, torch, pytorch_lightning; print('env-check OK rfdetr', torch.__version__)"
 # Extra dependencies declared in model.yaml (`dependencies:`) or added to
 # requirements.txt by hand — installed on top of the preset's own stack.
 COPY requirements.txt /app/requirements.txt
