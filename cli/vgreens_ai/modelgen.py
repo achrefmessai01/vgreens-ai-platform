@@ -1,9 +1,9 @@
 """Model repository generator.
 
 Renders a complete, ready-to-push model repo from a validated model.yaml.
-The runnable code (entrypoint/train/process/Dockerfile) is generic across
-Ultralytics detection models — the same contract-compliant code proven by
-vgreens-model-strawberry-disease. Only config/CI/README are templated per spec.
+Detection uses RF-DETR (Apache-2.0); classification/segmentation and any other
+task use the runnable custom_python reference. Ultralytics/YOLO is not used
+(AGPL-3.0). Only config/CI/README are templated per spec.
 
 custom_python emits a RUNNABLE reference (train.py/process.py train a trivial
 baseline and honour the contract) so the pipeline is green from commit 1; the
@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-# --- constant, generic Ultralytics-detection code (contract-compliant) ------ #
+# --- shared contract-compliant entrypoint (all presets) --------------------- #
 _ENTRYPOINT_PY = '''\
 """Container entrypoint. Dispatches on JOB_TYPE: training -> train.py, processing -> process.py."""
 import os
@@ -24,144 +24,6 @@ mode = os.environ.get("JOB_TYPE", "training")
 script = "/app/process.py" if mode == "processing" else "/app/train.py"
 print(f"[entrypoint] JOB_TYPE={mode} -> {script}", flush=True)
 runpy.run_path(script, run_name="__main__")
-'''
-
-_TRAIN_PY = '''\
-"""YOLO detection training — platform contract entrypoint.
-
-reads  /data (ro), /config/job.yaml ; writes /out/model.pt, /out/eval/metrics.json,
-/out/evaluation_report.md ; exit 0 on success. /data is copied to a writable dir
-because ultralytics writes a label cache next to the labels.
-"""
-import json
-import os
-import shutil
-import subprocess
-import sys
-from pathlib import Path
-
-# Force MKL's GNU threading layer BEFORE importing torch/ultralytics. The conda
-# base image's Intel MKL otherwise selects MKL_THREADING_LAYER=INTEL, which
-# clashes with libgomp.so.1 in the DDP subprocesses Ultralytics spawns for
-# multi-GPU training and aborts 2-GPU runs. Must precede the first torch import.
-os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
-
-import yaml
-from ultralytics import YOLO
-
-OUT = Path("/out")
-CONFIG = Path("/config/job.yaml")
-WORK = Path("/tmp/ds")
-
-
-def main() -> int:
-    (OUT / "eval").mkdir(parents=True, exist_ok=True)
-    cfg = yaml.safe_load(CONFIG.read_text()) if CONFIG.is_file() else {}
-    t = (cfg or {}).get("train", {})
-    model_name = t.get("model", "yolo11n.pt")
-    epochs = int(t.get("epochs", 50))
-    imgsz = int(t.get("imgsz", 640))
-    batch = t.get("batch", 16)
-
-    if WORK.exists():
-        shutil.rmtree(WORK)
-    shutil.copytree("/data", WORK)
-    data_yaml = WORK / "data.yaml"
-    dy = yaml.safe_load(data_yaml.read_text())
-    dy["path"] = str(WORK)
-    data_yaml.write_text(yaml.dump(dy))
-
-    # device follows GPU_COUNT: 1 GPU -> 0, 2 GPUs -> [0,1] (ultralytics DDP).
-    gpu_count = int(os.environ.get("GPU_COUNT", "1"))
-    device = list(range(gpu_count)) if gpu_count > 1 else 0
-    print(f"[train] model={model_name} epochs={epochs} imgsz={imgsz} batch={batch} "
-          f"gpu_count={gpu_count} device={device}", flush=True)
-    model = YOLO(model_name)
-    # amp=False skips Ultralytics' AMP self-check, which does a probe inference on a
-    # bundled asset and crashes in offline containers (cv2.resize on a non-array).
-    model.train(data=str(data_yaml), epochs=epochs, imgsz=imgsz, batch=batch, device=device,
-                amp=False,
-                project=str(OUT / "runs"), name="train", exist_ok=True, plots=True, verbose=True)
-
-    metrics = model.val(data=str(data_yaml), device=0, project=str(OUT / "runs"),
-                        name="val", exist_ok=True)
-    m = {"mAP50": round(float(metrics.box.map50), 4), "mAP50-95": round(float(metrics.box.map), 4),
-         "precision": round(float(metrics.box.mp), 4), "recall": round(float(metrics.box.mr), 4)}
-    (OUT / "eval" / "metrics.json").write_text(json.dumps(m, indent=2))
-
-    best = OUT / "runs" / "train" / "weights" / "best.pt"
-    if not best.exists():
-        sys.stderr.write("[train] no best.pt produced\\n")
-        return 1
-    shutil.copyfile(best, OUT / "model.pt")
-    (OUT / "evaluation_report.md").write_text(
-        f"# {os.environ.get('MODEL_NAME', 'model')} — evaluation\\n\\n"
-        f"- epochs: {epochs} imgsz: {imgsz} batch: {batch}\\n\\n"
-        f"- mAP@0.5: {m['mAP50']}\\n- mAP@0.5:0.95: {m['mAP50-95']}\\n"
-        f"- precision: {m['precision']}\\n- recall: {m['recall']}\\n")
-    # Container runs as root; relax /out so the non-root worker can copy it to NAS.
-    subprocess.run(["chmod", "-R", "a+rwX", "/out"], check=False)
-    print(f"[train] done: {m}", flush=True)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-'''
-
-_PROCESS_PY = '''\
-"""Processing/inference — serves the ACTIVE promoted model (/model/model.pt)."""
-import json
-import os
-import sys
-from pathlib import Path
-
-import torch
-from ultralytics import YOLO
-
-try:
-    import yaml
-except ModuleNotFoundError:
-    yaml = None
-
-OUT = Path("/out")
-DATA = Path("/data")
-MODEL = Path("/model/model.pt")
-CONFIG = Path("/config/job.yaml")
-
-
-def main() -> int:
-    OUT.mkdir(parents=True, exist_ok=True)
-    if not MODEL.is_file():
-        sys.stderr.write("no model at /model/model.pt — is a version promoted?\\n")
-        return 1
-    conf = 0.25
-    if yaml and CONFIG.is_file():
-        conf = float((yaml.safe_load(CONFIG.read_text()) or {}).get("process", {}).get("conf", conf))
-    images = sorted(p for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.PNG") for p in DATA.rglob(ext))
-    if not images:
-        sys.stderr.write("no images under /data\\n")
-        return 1
-    device = 0 if torch.cuda.is_available() else "cpu"
-    model = YOLO(str(MODEL))
-    names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names or []))
-    per_class, total = {}, 0
-    for i in range(0, len(images), 64):
-        for r in model.predict(source=[str(p) for p in images[i:i + 64]], device=device, conf=conf, verbose=False):
-            total += len(r.boxes)
-            for c in r.boxes.cls.tolist():
-                per_class[int(c)] = per_class.get(int(c), 0) + 1
-    report = {"model": os.environ.get("MODEL_NAME", ""), "model_version": os.environ.get("MODEL_VERSION", ""),
-              "images": len(images), "total_detections": total,
-              "by_class": {names.get(k, str(k)): v for k, v in sorted(per_class.items())},
-              "conf_threshold": conf}
-    (OUT / "report.json").write_text(json.dumps(report, indent=2))
-    print(f"[process] done: {report}", flush=True)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
 '''
 
 _RFDETR_TRAIN = '''\
@@ -574,36 +436,6 @@ if __name__ == "__main__":
 _GITIGNORE = "__pycache__/\n*.pyc\n.pytest_cache/\nruns/\nout/\n*.pt\n.DS_Store\n"
 
 
-def _dockerfile(base_model: str) -> str:
-    # opencv-python-headless (not opencv-python) has no libGL/X11 system deps, so
-    # we don't need `apt-get install libgl1 libglib2.0-0` — which means the build
-    # never depends on the Ubuntu package mirror being reachable.
-    return f"""\
-# {base_model} detection image (ultralytics). PyTorch CUDA base proven on this host.
-# NumPy-1 base: torch 2.3.1 is built against NumPy 1.x, so it agrees with
-# ultralytics (which caps numpy<2) and the opencv-headless 4.9 (numpy-1) wheel.
-# The 2.4.1 tag drifted to a NumPy-2 build, which breaks torch.from_numpy once
-# ultralytics downgrades numpy to 1.x.
-FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
-# Multi-GPU (DDP) spawns training subprocesses; the conda image's Intel MKL
-# otherwise picks MKL_THREADING_LAYER=INTEL, which clashes with libgomp.so.1
-# (GNU OpenMP) in the child and aborts 2-GPU runs. Force the GNU layer so it
-# matches. Harmless for single-GPU. See torch.distributed / Ultralytics DDP.
-ENV MKL_THREADING_LAYER=GNU
-RUN pip install --no-cache-dir "ultralytics==8.3.0" pyyaml \\
- && pip uninstall -y opencv-python opencv-python-headless >/dev/null 2>&1 || true \\
- && pip install --no-cache-dir "numpy==1.26.4" "opencv-python-headless==4.9.0.80" \\
- && python -c "import numpy as np, cv2, torch; a=np.zeros((16,16,3),np.uint8); cv2.warpAffine(a, np.eye(2,3,dtype=np.float32),(16,16)); torch.from_numpy(a); from ultralytics import YOLO; print('env-check OK numpy', np.__version__, 'cv2', cv2.__version__, 'torch', torch.__version__)"
-RUN python -c "from ultralytics import YOLO; YOLO('{base_model}')"
-# Extra dependencies declared in model.yaml (`dependencies:`) or added to
-# requirements.txt by hand — installed on top of the preset's own stack.
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-WORKDIR /app
-COPY train.py process.py entrypoint.py /app/
-ENTRYPOINT ["python", "/app/entrypoint.py"]
-"""
-
 
 def _dockerfile_custom() -> str:
     # Lightweight base for the pure-Python custom reference. No CUDA/apt, so no
@@ -624,14 +456,12 @@ ENTRYPOINT ["python", "/app/entrypoint.py"]
 
 
 def _dockerfile_rfdetr() -> str:
-    # RF-DETR (Apache-2.0) detection image. Same PyTorch CUDA base as the legacy
-    # ultralytics image (proven on this host). No yolo prefetch — RF-DETR reads
-    # our YOLO datasets directly at train time via dataset_file="yolo".
+    # RF-DETR (Apache-2.0) detection image. RF-DETR reads YOLO-format datasets
+    # directly at train time via dataset_file="yolo" (no COCO conversion).
     return """\
 # RF-DETR (Apache-2.0) detection image. RF-DETR pulls transformers 5.x, which
 # imports torch.distributed.tensor.DTensor — only present in PyTorch >= 2.5 — so
-# this image uses a torch-2.5 base (NOT the 2.3.1 base the ultralytics image needs
-# for its numpy<2 pin; RF-DETR has no such cap and works with numpy 2).
+# this image uses a torch-2.5 base and works with numpy 2 (no numpy<2 pin needed).
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 # Multi-GPU (DDP) spawns training subprocesses; the conda image's Intel MKL
 # otherwise picks MKL_THREADING_LAYER=INTEL, which clashes with libgomp.so.1
@@ -665,9 +495,7 @@ def _config_yaml(spec: dict) -> str:
     t = spec.get("training", {})
     v = spec.get("validation", {})
     p = spec.get("processing", {})
-    train = {"model": t.get("base_model", "yolo11n.pt"),
-             "epochs": t.get("epochs", 50), "imgsz": t.get("image_size", 640),
-             "batch": t.get("batch_size", 16) if isinstance(t.get("batch_size"), int) else 16}
+    train = {"epochs": t.get("epochs", 50)}
     # Pass through RF-DETR native batching controls + variant when present so the
     # generated train.py can read them from /config/job.yaml.
     if t.get("model_variant"):
@@ -765,23 +593,6 @@ def _requirements_txt(spec: dict) -> str:
     return header + body
 
 
-def _render_ultra(spec: dict) -> dict:
-    m = spec["model"]["name"]
-    base = spec.get("training", {}).get("base_model", "yolo11n.pt")
-    preset = spec["template"]["preset"]
-    return {
-        "entrypoint.py": _ENTRYPOINT_PY,
-        "train.py": _TRAIN_PY,
-        "process.py": _PROCESS_PY,
-        "Dockerfile": _dockerfile(base),
-        "requirements.txt": _requirements_txt(spec),
-        f"configs/{m}.yaml": _config_yaml(spec),
-        ".gitlab-ci.yml": _gitlab_ci(spec),
-        "tests/test_contract.py": _CONTRACT_TEST,
-        "README.md": _readme(spec, preset),
-        ".gitignore": _GITIGNORE,
-    }
-
 
 def _render_rfdetr(spec: dict) -> dict:
     m = spec["model"]["name"]
@@ -820,8 +631,6 @@ def render(spec: dict) -> dict:
     preset = (spec.get("template") or {}).get("preset")
     if preset == "rfdetr_detection":
         return _render_rfdetr(spec)
-    if preset in ("ultralytics_detection",):
-        return _render_ultra(spec)
     if preset == "custom_python":
         return _render_custom(spec)
     # rfdetr_segmentation / cnn_classification are declared presets but not yet
@@ -831,7 +640,7 @@ def render(spec: dict) -> dict:
         return _render_custom(spec)
     raise ValueError(f"generator for preset '{preset}' is not implemented yet "
                      "(available: rfdetr_detection, rfdetr_segmentation, "
-                     "cnn_classification, ultralytics_detection, custom_python)")
+                     "cnn_classification, custom_python)")
 
 
 def generate(spec: Any, out_dir: str, dry_run: bool = False, force: bool = False) -> list[str]:

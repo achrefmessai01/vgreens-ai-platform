@@ -6,9 +6,9 @@ from vgreens_ai import modelspec
 VALID = {
     "schema_version": 1,
     "model": {"name": "strawberry_ripeness_disease", "task": "object_detection", "owner": "ai-team"},
-    "template": {"preset": "ultralytics_detection", "template_version": "v1.0.0"},
+    "template": {"preset": "rfdetr_detection", "template_version": "v1.0.0"},
     "dataset": {"name": "strawberry_disease_auto", "version": "v1"},
-    "training": {"base_model": "yolo11n.pt", "epochs": 50, "gpu_count": 1},
+    "training": {"model_variant": "base", "epochs": 50, "gpu_count": 1},
     "validation": {"thresholds": {"mAP50": 0.5}},
     "repository": {"namespace": "achrefmessai", "name": "vgreens-model-x"},
 }

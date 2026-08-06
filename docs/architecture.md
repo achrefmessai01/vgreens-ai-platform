@@ -208,7 +208,7 @@ A model is declared in a **`model.yaml`** (schema-validated): name, task, preset
 dataset, training params, thresholds, repository. `model init` writes it
 interactively; the **generator** turns it into a complete repo (contract-compliant
 `train.py`/`process.py`, a headless Dockerfile, CI config, tests). Presets
-(`ultralytics_detection/classification/segmentation`) emit working YOLO code;
+(`rfdetr_detection/classification/segmentation`) emit working RF-DETR detection code;
 `custom_python` emits a **runnable reference** the engineer edits. `onboard
 --create-repo` creates the GitLab project **inside the `vgreens-models` group** so
 it automatically inherits the CI runner, CI/CD variables, and the shared CI

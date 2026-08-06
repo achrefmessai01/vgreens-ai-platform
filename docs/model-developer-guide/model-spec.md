@@ -14,7 +14,7 @@ model:
   description: One-line description.
 
 template:
-  preset: ultralytics_detection      # see presets.md; must match model.task
+  preset: rfdetr_detection      # see presets.md; must match model.task
   template_version: v1.0.0
 
 dataset:
@@ -22,7 +22,7 @@ dataset:
   version: v1                        # a frozen version, or 'latest_frozen'
 
 training:
-  base_model: yolo11n.pt             # pretrained backbone to fine-tune (preset models)
+  model_variant: base                # RF-DETR variant: base|nano|small|medium|large
   epochs: 50
   image_size: 640
   batch_size: 16                     # int, or 'auto' for supported presets

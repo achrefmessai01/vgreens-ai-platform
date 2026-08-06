@@ -15,19 +15,12 @@ GPU_COUNTS = (1, 2)
 
 # preset -> {task it implements, whether it generates working code}
 #
-# NOTE: the `ultralytics_*` presets are LEGACY. Ultralytics is AGPL-3.0, which is
-# commercially risky for a proprietary platform. They are kept only so previously
-# generated specs still validate. Prefer the `rfdetr_*` presets (RF-DETR is
-# Apache-2.0) for new detection models.
+# Detection/segmentation use RF-DETR (Apache-2.0). Ultralytics/YOLO is NOT used:
+# it is AGPL-3.0, which is commercially risky for a proprietary platform.
 PRESETS: dict[str, dict] = {
-    # --- preferred: RF-DETR (Apache-2.0) ---
     "rfdetr_detection": {"task": "object_detection", "generates_working_code": True},
     "rfdetr_segmentation": {"task": "segmentation", "generates_working_code": False},
     "cnn_classification": {"task": "classification", "generates_working_code": False},
-    # --- legacy: Ultralytics (AGPL-3.0, commercially risky) ---
-    "ultralytics_detection": {"task": "object_detection", "generates_working_code": True},
-    "ultralytics_classification": {"task": "classification", "generates_working_code": True},
-    "ultralytics_segmentation": {"task": "segmentation", "generates_working_code": True},
     "custom_python": {"task": "custom", "generates_working_code": True},
 }
 

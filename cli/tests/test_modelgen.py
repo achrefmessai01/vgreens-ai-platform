@@ -8,9 +8,9 @@ from vgreens_ai import modelgen
 SPEC = {
     "schema_version": 1,
     "model": {"name": "sd_test", "display_name": "SD test", "task": "object_detection"},
-    "template": {"preset": "ultralytics_detection", "template_version": "v1.0.0"},
+    "template": {"preset": "rfdetr_detection", "template_version": "v1.0.0"},
     "dataset": {"name": "strawberry_disease_auto", "version": "v1"},
-    "training": {"base_model": "yolo11n.pt", "epochs": 30, "image_size": 640, "batch_size": 16},
+    "training": {"epochs": 30, "image_size": 640, "batch_size": 16},
     "validation": {"thresholds": {"mAP50": 0.5}},
     "processing": {"confidence_threshold": 0.3},
     "repository": {"namespace": "achrefmessai", "name": "vgreens-model-sd-test"},
@@ -72,9 +72,9 @@ def test_custom_python_skeleton_not_placeholder(tmp_path):
 def test_unimplemented_preset_raises(tmp_path):
     s = copy.deepcopy(SPEC)
     s["model"]["task"] = "classification"
-    s["template"]["preset"] = "ultralytics_classification"
+    s["template"]["preset"] = "made_up_preset"
     try:
         modelgen.generate(s, str(tmp_path / "c"))
-        assert False, "should not implement classification yet"
+        assert False, "unknown preset should raise"
     except ValueError as e:
         assert "not implemented" in str(e)

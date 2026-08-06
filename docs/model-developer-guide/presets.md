@@ -8,14 +8,14 @@ vgreens-ai model presets
 
 | Preset | Task | Generates working code? |
 |--------|------|-------------------------|
-| `ultralytics_detection` | object_detection | yes — ready to train, no edits |
-| `ultralytics_classification` | classification | (planned) |
-| `ultralytics_segmentation` | segmentation | (planned) |
+| `rfdetr_detection` | object_detection | yes — ready to train, no edits |
+| `cnn_classification` | classification | (planned) |
+| `rfdetr_segmentation` | segmentation | (planned) |
 | `custom_python` | custom | skeleton only — you implement it |
 
 ## Which to use
 
-- **Your task is standard object detection?** Use `ultralytics_detection`. You
+- **Your task is standard object detection?** Use `rfdetr_detection`. You
   write only `model.yaml`; the generated `train.py`/`process.py` are complete and
   identical to the proven reference model. → [golden-path.md](golden-path.md)
 

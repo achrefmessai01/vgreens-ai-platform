@@ -101,4 +101,4 @@ The `custom_python` path is the escape hatch for one-offs. If your team keeps
 building the same kind of custom model, add a preset for it in
 `cli/vgreens_ai/modelspec.py` (`PRESETS`) plus a `_render_*` in `modelgen.py` that
 emits working code — then those models are back to the one-command golden path,
-exactly like `ultralytics_detection`.
+exactly like `rfdetr_detection`.

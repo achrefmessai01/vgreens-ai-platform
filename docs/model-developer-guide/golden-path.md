@@ -1,6 +1,6 @@
 # Golden path — a supported model in five minutes
 
-For a standard task (object detection with Ultralytics/YOLO) you write **no code**.
+For a standard task (object detection with RF-DETR) you write **no code**.
 You author a `model.yaml`, generate the repo, build, train, review, promote.
 
 ## 0. Have a frozen dataset
@@ -18,7 +18,7 @@ Copy the example and edit it (full field reference: `model-spec.md`):
 ```bash
 cp docs/model-developer-guide/model.example.yaml model.yaml
 ```
-The essentials: `model.name`, `template.preset: ultralytics_detection`,
+The essentials: `model.name`, `template.preset: rfdetr_detection`,
 `dataset.{name,version}` (must be frozen), and `validation.thresholds` (the bar a
 trained version must clear to be promotable).
 

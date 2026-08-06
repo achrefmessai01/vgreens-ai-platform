@@ -3,7 +3,7 @@
 How to add and ship a model on the vGreens AI platform. Start here.
 
 - **[golden-path.md](golden-path.md)** — the five-minute path for a supported
-  model (Ultralytics detection). Start here if your model is a standard task.
+  model (RF-DETR detection). Start here if your model is a standard task.
 - **[model-spec.md](model-spec.md)** — every field of `model.yaml`.
 - **[presets.md](presets.md)** — the available presets and when to use each.
 - **[custom-model.md](custom-model.md)** — bring your own model (any framework)

@@ -10,7 +10,7 @@ model:
   description: Detect strawberry fruit ripeness and plant-disease conditions.
 
 template:
-  preset: ultralytics_detection      # ultralytics_{detection,classification,segmentation} | custom_python
+  preset: rfdetr_detection      # rfdetr_detection | custom_python
   template_version: v1.0.0
 
 dataset:
@@ -18,7 +18,7 @@ dataset:
   version: v1                        # explicit version, or 'latest_frozen'
 
 training:
-  base_model: yolo11n.pt
+  model_variant: base
   epochs: 50
   image_size: 640
   batch_size: 16

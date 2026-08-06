@@ -1,11 +1,11 @@
 # Benchmark — 1-GPU vs 2-GPU training
 
 Measures the wall-clock speedup from training the same model on one vs two GPUs,
-using the platform's per-GPU allocation and ultralytics DDP (`device=[0,1]`).
+using the platform's per-GPU allocation and PyTorch DDP (`device=[0,1]`).
 
 ## Method
 
-- **Model:** `strawberry_disease` (YOLO11n detection), identical image for both runs.
+- **Model:** `strawberry_disease` (RF-DETR detection), identical image for both runs.
 - **Dataset:** `strawberry_disease_auto:v1` (~11,700 images, frozen).
 - **Config:** identical (`epochs=10`, `imgsz=640`, `batch=16`); only `--gpu-count` differs.
 - **Metric:** wall-clock from the job's `started_at` → `finished_at`; mAP@0.5 checked to
@@ -81,7 +81,7 @@ Run on 2026-07-26, `strawberry_disease_auto:v1`, `epochs=10`, image `strawberry-
   training does not cost quality.
 - **What this validates:** the platform's two-GPU path works end-to-end — per-GPU
   locks reserve both devices, the worker runs `--gpus "device=0,1"`, and
-  `train.py` sets `device=[0,1]` for ultralytics DDP — producing a validated model
+  `train.py` sets `device=[0,1]` for PyTorch DDP — producing a validated model
   version, not just "both GPUs visible."
 
 _Numbers captured from `vgreens-ai job show` (timings) and `vgreens-ai model show` (metrics)._

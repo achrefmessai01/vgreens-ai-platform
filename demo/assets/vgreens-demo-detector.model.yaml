@@ -1,0 +1,41 @@
+# Lightweight REFERENCE model for the tutor demo — NOT a production model.
+# Purpose: validate the complete vGreens MLOps lifecycle end to end (onboard ->
+# CI -> image -> train -> register -> promote -> process) with a run that
+# finishes in a few minutes on one RTX 4070.
+#
+# Task: object detection (matches the tested Dataset Factory + the already-frozen
+# demo_berries:v1 dataset). Ultralytics YOLOv8-nano, tiny image size, 3 epochs.
+schema_version: 1
+
+model:
+  name: vgreens_demo_detector
+  task: object_detection
+  owner: achref
+
+template:
+  preset: rfdetr_detection           # RF-DETR (Apache-2.0) — working detection code
+
+dataset:
+  name: demo_berries                 # already imported + frozen on the platform
+  version: v1
+
+training:
+  epochs: 3                          # tiny — reference run, not production accuracy
+  image_size: 560                    # RF-DETR resolution should be divisible by 56
+  batch_size: 4
+  effective_batch: 16                # grad-accum derived to reach this
+  gpu_count: 1
+  model_variant: base                # RFDETRBase (nano/small/medium/large also valid)
+
+validation:
+  thresholds:
+    mAP50: 0.01                      # deliberately low: a reference model just needs
+                                     # to clear a floor so the candidate is 'validated'
+                                     # and promotable. NOT a production quality bar.
+
+processing:
+  confidence_threshold: 0.25
+
+repository:
+  namespace: vgreens-models
+  name: vgreens-demo-detector
