@@ -1549,6 +1549,28 @@ def system_overview(_: str = Depends(authn.actor("viewer"))) -> dict:
 # raises — every risky bit is guarded and degrades to unknown/empty so the
 # stream can keep emitting.
 # --------------------------------------------------------------------------- #
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# tqdm/download progress noise: "86%|####|", "40.5MiB/s]", "3.2it/s]"
+_PROGRESS_RE = re.compile(r"\d+%\||\d+(\.\d+)?\s*[KMG]?i?B/s|\d+(\.\d+)?\s*it/s\]|\|[\s#█▏▎▍▌▋▊▉]*\|")
+
+
+def _clean_error(raw: object) -> dict:
+    """Turn a raw job error/log tail into a concise one-line message + a fuller
+    (still bounded) detail. Strips ANSI colours and tqdm/download progress lines,
+    then prefers the last line that looks like a real exception."""
+    if not isinstance(raw, str) or not raw.strip():
+        return {"message": None, "detail": None}
+    text = _ANSI_RE.sub("", raw).replace("\r", "\n")
+    lines = [ln.strip() for ln in text.split("\n")]
+    lines = [ln for ln in lines if ln and not _PROGRESS_RE.search(ln)]
+    if not lines:
+        return {"message": raw.strip()[:240], "detail": raw.strip()[:1500]}
+    exc = [ln for ln in lines
+           if re.search(r"error|exception|errno|not found|denied|missing|traceback", ln, re.I)]
+    message = (exc[-1] if exc else lines[-1])[:240]
+    return {"message": message, "detail": "\n".join(lines)[:1500]}
+
+
 def _monitor_snapshot() -> dict:
     """One JSON-serialisable monitoring payload for the live web view."""
     # System overview (workers/gpus/queues/alerts/backups/jobs_by_status).
@@ -1611,7 +1633,7 @@ def _monitor_snapshot() -> dict:
                 "started_at": j.get("started_at"), "finished_at": j.get("finished_at"),
                 "duration_seconds": _dur(j), "output_path": j.get("output_path"),
                 "result_version": j.get("result_version"),
-                "error": (jerr[:300] if isinstance(jerr, str) else jerr),
+                "error": _clean_error(jerr)["message"],
             })
     except Exception:  # noqa: BLE001
         recent_jobs = []
@@ -1620,11 +1642,13 @@ def _monitor_snapshot() -> dict:
     recent_errors: list[dict] = []
     try:
         for j in db.list_jobs(status="failed", limit=6):
-            err = j.get("error")
+            ce = _clean_error(j.get("error"))
             recent_errors.append({
                 "job_id": j.get("job_id"), "model_name": j.get("model_name"),
+                "job_type": j.get("job_type"),
+                "at": j.get("finished_at") or j.get("created_at"),
                 "created_at": j.get("created_at"),
-                "error": (err[:300] if isinstance(err, str) else err),
+                "message": ce["message"], "detail": ce["detail"],
             })
     except Exception:  # noqa: BLE001
         recent_errors = []
