@@ -12,10 +12,12 @@ This file is part of the 1.1 scaffold; the broker (1.2) runs before the API.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import json
 import re
 import secrets
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +26,7 @@ from typing import Literal, Optional
 import time
 
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from prometheus_client import (
     CONTENT_TYPE_LATEST, REGISTRY, CollectorRegistry, Counter, Gauge, Histogram,
     generate_latest,
@@ -1539,6 +1541,163 @@ def system_overview(_: str = Depends(authn.actor("viewer"))) -> dict:
         "alerts": {"available": alerts["available"], "firing": sev,
                    "list": [a for a in alerts["alerts"] if a["state"] == "firing"]},
     }
+
+
+# --------------------------------------------------------------------------- #
+# LIVE monitoring (Phase 1): a single curated snapshot the web app renders and
+# streams over SSE. _monitor_snapshot() reuses the collectors above and NEVER
+# raises — every risky bit is guarded and degrades to unknown/empty so the
+# stream can keep emitting.
+# --------------------------------------------------------------------------- #
+def _monitor_snapshot() -> dict:
+    """One JSON-serialisable monitoring payload for the live web view."""
+    # System overview (workers/gpus/queues/alerts/backups/jobs_by_status).
+    try:
+        overview = system_overview()
+    except Exception:  # noqa: BLE001 - monitoring must degrade, not crash
+        overview = {}
+
+    # Running jobs indexed by GPU, so each GPU can be annotated with its job.
+    try:
+        running = db.list_jobs(status="running", limit=1000)
+    except Exception:  # noqa: BLE001
+        running = []
+    running_by_gpu: dict[int, dict] = {}
+    for j in running:
+        g = j.get("gpu")
+        if g is not None and g not in running_by_gpu:
+            running_by_gpu[g] = j
+
+    # GPUs enriched with assigned_worker + current_job (from the running jobs).
+    gpus: list[dict] = []
+    try:
+        for raw in _query_gpus():
+            g = dict(raw)
+            gj = running_by_gpu.get(g.get("index"))
+            g["assigned_worker"] = gj.get("worker") if gj else None
+            g["current_job"] = (
+                {"job_id": gj.get("job_id"), "model_name": gj.get("model_name"),
+                 "requested_by": gj.get("requested_by")} if gj else None
+            )
+            gpus.append(g)
+    except Exception:  # noqa: BLE001
+        gpus = []
+
+    # Workers — same shape as GET /workers.
+    try:
+        workers = read_workers()
+    except Exception:  # noqa: BLE001
+        workers = []
+
+    def _dur(job: dict) -> Optional[float]:
+        try:
+            if job.get("started_at") and job.get("finished_at"):
+                delta = (datetime.fromisoformat(job["finished_at"])
+                         - datetime.fromisoformat(job["started_at"])).total_seconds()
+                return round(delta, 1)
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    # Recent jobs (newest first).
+    recent_jobs: list[dict] = []
+    try:
+        for j in db.list_jobs(limit=12):
+            jerr = j.get("error")
+            recent_jobs.append({
+                "job_id": j.get("job_id"), "job_type": j.get("job_type"),
+                "model_name": j.get("model_name"), "status": j.get("status"),
+                "requested_by": j.get("requested_by"), "created_at": j.get("created_at"),
+                "started_at": j.get("started_at"), "finished_at": j.get("finished_at"),
+                "duration_seconds": _dur(j), "output_path": j.get("output_path"),
+                "result_version": j.get("result_version"),
+                "error": (jerr[:300] if isinstance(jerr, str) else jerr),
+            })
+    except Exception:  # noqa: BLE001
+        recent_jobs = []
+
+    # Most recent failures (error truncated so a huge traceback can't bloat SSE).
+    recent_errors: list[dict] = []
+    try:
+        for j in db.list_jobs(status="failed", limit=6):
+            err = j.get("error")
+            recent_errors.append({
+                "job_id": j.get("job_id"), "model_name": j.get("model_name"),
+                "created_at": j.get("created_at"),
+                "error": (err[:300] if isinstance(err, str) else err),
+            })
+    except Exception:  # noqa: BLE001
+        recent_errors = []
+
+    # Storage: NAS + NVMe cache capacity (guarded; None where unavailable).
+    nas_mounted = False
+    nas_total = nas_free = None
+    try:
+        nas_mounted = os.path.ismount(NAS_MOUNTPOINT)
+        st = os.statvfs(NAS_MOUNTPOINT)
+        nas_total = st.f_blocks * st.f_frsize
+        nas_free = st.f_bavail * st.f_frsize
+    except OSError:
+        pass
+    nvme_path = os.environ.get("NVME_CACHE", "/nvme")
+    nvme_total = nvme_free = None
+    try:
+        if os.path.exists(nvme_path):
+            du = shutil.disk_usage(nvme_path)
+            nvme_total, nvme_free = du.total, du.free
+    except OSError:
+        pass
+    storage = {
+        "nas_mounted": nas_mounted, "nas_path": NAS_MOUNTPOINT,
+        "nas_total_bytes": nas_total, "nas_free_bytes": nas_free,
+        "nvme_path": nvme_path, "nvme_total_bytes": nvme_total, "nvme_free_bytes": nvme_free,
+    }
+
+    return {
+        "overview": overview, "gpus": gpus, "workers": workers,
+        "recent_jobs": recent_jobs, "recent_errors": recent_errors,
+        "storage": storage,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/system/snapshot")
+def system_snapshot(_: str = Depends(authn.actor("viewer"))) -> dict:
+    """Point-in-time monitoring payload — the initial load for the live view."""
+    return _monitor_snapshot()
+
+
+@app.get("/system/stream")
+async def system_stream(request: Request, _: str = Depends(authn.actor("viewer"))):
+    """Server-Sent Events stream of monitoring snapshots.
+
+    Caddy/HTTP passes SSE straight through (it is a plain long-lived HTTP
+    response), and the browser's EventSource sends the vg_session cookie
+    automatically — so auth here is identical to every other /system/* endpoint.
+    Emits one snapshot immediately, then one every MONITOR_STREAM_INTERVAL
+    seconds until the client disconnects.
+    """
+    interval = float(os.environ.get("MONITOR_STREAM_INTERVAL", "3"))
+
+    async def gen():
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                # _monitor_snapshot() is sync (DB + nvidia-smi); offload it so a
+                # slow nvidia-smi never blocks the event loop.
+                snapshot = await asyncio.to_thread(_monitor_snapshot)
+            except Exception as exc:  # noqa: BLE001 - never break the stream
+                snapshot = {"error": str(exc),
+                            "generated_at": datetime.now(timezone.utc).isoformat()}
+            yield f"data: {json.dumps(snapshot)}\n\n"
+            await asyncio.sleep(interval)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    })
 
 
 # Curated time-series. The browser may ONLY pick a window from a fixed allowlist;
