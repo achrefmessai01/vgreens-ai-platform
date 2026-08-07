@@ -16,14 +16,41 @@ from typing import Any
 
 # --- shared contract-compliant entrypoint (all presets) --------------------- #
 _ENTRYPOINT_PY = '''\
-"""Container entrypoint. Dispatches on JOB_TYPE: training -> train.py, processing -> process.py."""
+"""Container entrypoint. Dispatches on JOB_TYPE: training -> train.py, processing -> process.py.
+
+Multi-GPU: when the platform requests >1 GPU it sets GPU_COUNT and exposes that
+many devices to the container. For TRAINING we then relaunch train.py under
+torchrun with one process per GPU (DistributedDataParallel). Single-GPU and
+processing jobs run in-process exactly as before. If torchrun is unavailable we
+fall back to a single process (single-GPU) rather than fail.
+"""
 import os
 import runpy
+import subprocess
+import sys
 
 mode = os.environ.get("JOB_TYPE", "training")
-script = "/app/process.py" if mode == "processing" else "/app/train.py"
-print(f"[entrypoint] JOB_TYPE={mode} -> {script}", flush=True)
-runpy.run_path(script, run_name="__main__")
+if mode == "processing":
+    print("[entrypoint] JOB_TYPE=processing -> /app/process.py", flush=True)
+    runpy.run_path("/app/process.py", run_name="__main__")
+    raise SystemExit(0)
+
+gpu_count = int(os.environ.get("GPU_COUNT", "1") or 1)
+already = os.environ.get("VG_DDP_LAUNCHED") == "1"
+if gpu_count > 1 and not already:
+    cmd = [sys.executable, "-m", "torch.distributed.run",
+           "--standalone", f"--nproc_per_node={gpu_count}", "/app/train.py"]
+    print(f"[entrypoint] multi-GPU training on {gpu_count} GPUs via torchrun: "
+          f"{' '.join(cmd)}", flush=True)
+    env = dict(os.environ, VG_DDP_LAUNCHED="1")
+    rc = subprocess.call(cmd, env=env)
+    if rc == 0:
+        raise SystemExit(0)
+    # torchrun missing / failed to start -> fall back to single-process training.
+    print(f"[entrypoint] torchrun exited {rc}; falling back to single-GPU", flush=True)
+
+print("[entrypoint] JOB_TYPE=training -> /app/train.py", flush=True)
+runpy.run_path("/app/train.py", run_name="__main__")
 '''
 
 _RFDETR_TRAIN = '''\
@@ -159,13 +186,29 @@ def main() -> int:
         grad_accum = 4
     effective = batch_size * grad_accum
 
-    if WORK.exists():
-        shutil.rmtree(WORK)
-    shutil.copytree("/data", WORK)
+    # Distributed context (set by torchrun when the platform requests >1 GPU).
+    # Single-GPU runs have no RANK/WORLD_SIZE -> rank 0, world 1 -> unchanged path.
+    import time
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) or 0)
+    world = int(os.environ.get("WORLD_SIZE", "1") or 1)
+    is_main = rank == 0
 
-    print(f"[train] variant={variant} epochs={epochs} image_size={image_size} "
-          f"batch_size={batch_size} grad_accum_steps={grad_accum} "
-          f"effective_batch={effective}", flush=True)
+    # Stage /data once. Under DDP only rank 0 copies; other ranks wait for the
+    # sentinel so all processes read the same staged dataset without racing.
+    if is_main:
+        if WORK.exists():
+            shutil.rmtree(WORK)
+        shutil.copytree("/data", WORK)
+        (WORK / ".vg_ready").write_text("ok")
+    else:
+        for _ in range(1800):  # up to ~30 min for rank 0 to finish staging
+            if (WORK / ".vg_ready").exists():
+                break
+            time.sleep(1)
+
+    print(f"[train] rank={rank}/{world} variant={variant} epochs={epochs} "
+          f"image_size={image_size} batch_size={batch_size} "
+          f"grad_accum_steps={grad_accum} effective_batch={effective}", flush=True)
 
     import torch  # imported here, after the MKL env var is set above
     cls = _model_class(variant)
@@ -187,6 +230,12 @@ def main() -> int:
                 f"(was {batch_size} x {grad_accum} = {effective})\\n")
             return 2
         raise
+
+    # Under DDP, every rank trains but only rank 0 owns the artefacts. Non-main
+    # ranks stop here so the checkpoint, metrics and report are written exactly once.
+    if not is_main:
+        print(f"[train] rank {rank}/{world} finished (rank 0 writes outputs)", flush=True)
+        return 0
 
     # Pick the produced checkpoint: prefer an EMA/best *.pth (the smoothed one),
     # else the newest .pth. Filename may need a one-line tweak after the first run.
