@@ -85,6 +85,23 @@ OUT = Path("/out")
 CONFIG = Path("/config/job.yaml")
 WORK = Path("/tmp/ds")
 
+
+def _progress(**row):
+    """Append one JSON line to /out/metrics.jsonl (platform live-progress contract).
+
+    The API reads this file to show epoch/loss/mAP/ETA while the job runs. Each
+    line is a standalone JSON object; include an 'epoch' and 'total_epochs' so the
+    dashboard can draw a progress bar. Best-effort — never crashes training.
+    """
+    import time as _t
+    row.setdefault("ts", _t.strftime("%Y-%m-%dT%H:%M:%S"))
+    try:
+        with open(OUT / "metrics.jsonl", "a") as fh:
+            fh.write(json.dumps(row) + "\\n")
+    except OSError:
+        pass
+
+
 # model_variant -> RF-DETR class name
 _VARIANTS = {
     "base": "RFDETRBase",
@@ -166,7 +183,10 @@ def _compute_metrics(ckpt, ds_root, variant):
 
 
 def main() -> int:
-    (OUT / "eval").mkdir(parents=True, exist_ok=True)
+    # Standard output structure (platform contract): eval/ metrics, artifacts/,
+    # predictions/. metrics.jsonl (progress) + report.json are written below.
+    for d in ("eval", "artifacts", "predictions"):
+        (OUT / d).mkdir(parents=True, exist_ok=True)
     cfg = yaml.safe_load(CONFIG.read_text()) if CONFIG.is_file() else {}
     t = (cfg or {}).get("train", {})
 
@@ -209,6 +229,9 @@ def main() -> int:
     print(f"[train] rank={rank}/{world} variant={variant} epochs={epochs} "
           f"image_size={image_size} batch_size={batch_size} "
           f"grad_accum_steps={grad_accum} effective_batch={effective}", flush=True)
+
+    if is_main:
+        _progress(epoch=0, total_epochs=epochs, stage="start", world_size=world)
 
     import torch  # imported here, after the MKL env var is set above
     cls = _model_class(variant)
@@ -261,6 +284,23 @@ def main() -> int:
     if m.get("note"):
         lines.append(f"- note: {m['note']}")
     (OUT / "evaluation_report.md").write_text("\\n".join(lines) + "\\n")
+
+    # Final progress line + standard report.json (traceability contract).
+    _progress(epoch=epochs, total_epochs=epochs, stage="done",
+              **{k: v for k, v in m.items() if isinstance(v, (int, float))})
+    report = {
+        "model": os.environ.get("MODEL_NAME", "model"),
+        "job_type": "training",
+        "variant": variant,
+        "epochs": epochs,
+        "image_size": image_size,
+        "batch_size": batch_size,
+        "grad_accum_steps": grad_accum,
+        "effective_batch": effective,
+        "checkpoint": chosen.name,
+        "metrics": m,
+    }
+    (OUT / "report.json").write_text(json.dumps(report, indent=2))
     # The container runs as root; RF-DETR/Lightning checkpoints can be written
     # with restrictive perms that block the non-root worker from copying /out to
     # the NAS. Relax /out so every artefact is readable/traversable by the worker.
@@ -411,23 +451,47 @@ DATA = Path("/data")
 CONFIG = Path("/config/job.yaml")
 
 
+def _progress(**row):
+    """Append one JSON line to /out/metrics.jsonl (live-progress contract).
+    The dashboard reads epoch/total_epochs/metrics from here while training runs.
+    """
+    import time as _t
+    row.setdefault("ts", _t.strftime("%Y-%m-%dT%H:%M:%S"))
+    try:
+        with open(OUT / "metrics.jsonl", "a") as fh:
+            fh.write(json.dumps(row) + "\\n")
+    except OSError:
+        pass
+
+
 def main() -> int:
-    (OUT / "eval").mkdir(parents=True, exist_ok=True)
+    # Standard output structure (platform contract).
+    for d in ("eval", "artifacts", "predictions"):
+        (OUT / d).mkdir(parents=True, exist_ok=True)
     cfg = (yaml.safe_load(CONFIG.read_text()) if CONFIG.is_file() else {}) or {}
     epochs = int(cfg.get("train", {}).get("epochs", 5))
     samples = sorted(p for p in DATA.rglob("*") if p.is_file())
     print(f"[train] epochs={epochs} samples={len(samples)}", flush=True)
 
     # ===== REPLACE: build + train your model on the data in /data =====
+    # Emit one metrics.jsonl line per epoch so the platform shows live progress.
+    accuracy = 0.0
+    for ep in range(1, epochs + 1):
+        accuracy = (1.0 if samples else 0.0) * (ep / epochs)   # placeholder curve
+        _progress(epoch=ep, total_epochs=epochs, accuracy=round(float(accuracy), 4))
     model = {"kind": "baseline", "n_samples": len(samples), "epochs": epochs}
-    accuracy = 1.0 if samples else 0.0   # placeholder metric — compute a real one
     # ==================================================================
 
     with open(OUT / "model.pt", "wb") as fh:        # required artifact
         pickle.dump(model, fh)
     # metric keys here must include whatever you set under `thresholds` in the config
-    (OUT / "eval" / "metrics.json").write_text(
-        json.dumps({"accuracy": round(float(accuracy), 4)}, indent=2))
+    metrics = {"accuracy": round(float(accuracy), 4)}
+    (OUT / "eval" / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    (OUT / "report.json").write_text(json.dumps({
+        "model": __import__("os").environ.get("MODEL_NAME", "model"),
+        "job_type": "training", "epochs": epochs,
+        "n_samples": len(samples), "metrics": metrics,
+    }, indent=2))
     # Container runs as root; relax /out so the non-root worker can copy it to NAS.
     subprocess.run(["chmod", "-R", "a+rwX", "/out"], check=False)
     print(f"[train] wrote model.pt + metrics.json (accuracy={accuracy})", flush=True)

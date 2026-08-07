@@ -178,18 +178,44 @@ def _handle(job: dict, gpu_ids: list[int]) -> None:
     if not Path(config_path).exists():
         Path(config_path).write_text("{}\n")
 
+    # Live progress: the training container writes out/metrics.jsonl on the NVMe
+    # workdir, but /out is only copied to the NAS at the end. Mirror metrics.jsonl
+    # to the NAS every few seconds while the container runs so the API's live
+    # progress endpoint has fresh data. Best-effort; never affects the job.
+    nas_out = nas_folder / "out"
+    nas_out.mkdir(parents=True, exist_ok=True)
+    stop_sync = threading.Event()
+
+    def _sync_progress() -> None:
+        src = out_dir / "metrics.jsonl"
+        dst = nas_out / "metrics.jsonl"
+        while not stop_sync.is_set():
+            try:
+                if src.is_file():
+                    shutil.copyfile(src, dst)
+            except OSError:
+                pass
+            stop_sync.wait(5.0)
+
+    sync_thread = threading.Thread(target=_sync_progress, daemon=True)
+    sync_thread.start()
+
     t0 = time.time()
-    code, tail = runner.run_container(
-        image=job["docker_image"],
-        gpu_id=gpu_ids[0],
-        gpu_ids=gpu_ids,
-        data_dir=data_dir,
-        config_path=config_path,
-        out_dir=str(out_dir),
-        env=env,
-        log_path=log_path,
-        model_dir=model_dir,
-    )
+    try:
+        code, tail = runner.run_container(
+            image=job["docker_image"],
+            gpu_id=gpu_ids[0],
+            gpu_ids=gpu_ids,
+            data_dir=data_dir,
+            config_path=config_path,
+            out_dir=str(out_dir),
+            env=env,
+            log_path=log_path,
+            model_dir=model_dir,
+        )
+    finally:
+        stop_sync.set()
+        sync_thread.join(timeout=6)
     duration = time.time() - t0
 
     if code == 0:

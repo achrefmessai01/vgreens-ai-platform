@@ -208,6 +208,25 @@ MIGRATIONS: list[tuple[int, str, str]] = [
     (4, "jobs.gpu_count", """
         ALTER TABLE jobs ADD COLUMN gpu_count INTEGER NOT NULL DEFAULT 1;
     """),
+    (5, "job_templates", """
+        -- Reusable submit presets. A template is a stored partial job request:
+        -- an engineer picks one and only fills in what's left (e.g. dataset).
+        CREATE TABLE IF NOT EXISTS job_templates (
+            id            TEXT PRIMARY KEY,
+            name          TEXT NOT NULL,
+            description   TEXT,
+            job_type      TEXT NOT NULL,              -- training | processing
+            docker_image  TEXT,                       -- optional short ref or full URL
+            gpu_count     INTEGER NOT NULL DEFAULT 1,
+            dataset_name  TEXT,
+            config_yaml   TEXT,                        -- optional generated job.yaml body
+            defaults      TEXT,                        -- JSON: extra CreateJob fields
+            builtin       INTEGER NOT NULL DEFAULT 0,  -- 1 = seeded starter template
+            created_by    TEXT,
+            created_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_templates_type ON job_templates(job_type);
+    """),
 ]
 
 
@@ -284,8 +303,10 @@ def list_jobs(status=None, model=None, job_type=None, tenant=None, worker=None,
               limit: int = 50, offset: int = 0) -> list[dict]:
     where, params = _job_filters(status, model, job_type, tenant, worker)
     with _connect() as conn:
+        # Higher priority first, then newest — queued work of equal priority is FIFO.
         rows = conn.execute(
-            f"SELECT * FROM jobs {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM jobs {where} "
+            f"ORDER BY priority DESC, created_at DESC LIMIT ? OFFSET ?",
             params + [int(limit), int(offset)],
         ).fetchall()
         return [dict(r) for r in rows]
@@ -339,6 +360,50 @@ def count_by_status() -> dict:
             "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
         ).fetchall()
         return {r["status"]: r["n"] for r in rows}
+
+
+# --------------------------------------------------------------------------- #
+# job templates (reusable submit presets)
+# --------------------------------------------------------------------------- #
+_TEMPLATE_COLS = (
+    "id", "name", "description", "job_type", "docker_image", "gpu_count",
+    "dataset_name", "config_yaml", "defaults", "builtin", "created_by", "created_at",
+)
+
+
+def insert_template(tpl: dict) -> None:
+    values = [tpl.get(c) for c in _TEMPLATE_COLS]
+    placeholders = ",".join("?" for _ in _TEMPLATE_COLS)
+    with _connect() as conn:
+        conn.execute(
+            f"INSERT INTO job_templates ({','.join(_TEMPLATE_COLS)}) VALUES ({placeholders})",
+            values,
+        )
+
+
+def list_templates(job_type: str | None = None) -> list[dict]:
+    clause = "WHERE job_type = ?" if job_type else ""
+    params = [job_type] if job_type else []
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM job_templates {clause} ORDER BY builtin DESC, name ASC", params
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_template(template_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM job_templates WHERE id = ?", (template_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def delete_template(template_id: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM job_templates WHERE id = ? AND builtin = 0",
+                           (template_id,))
+        return cur.rowcount > 0
 
 
 # --------------------------------------------------------------------------- #

@@ -7,10 +7,12 @@ aliases (train, process, status, list-jobs, models, promote, rollback, cancel).
 """
 from __future__ import annotations
 
+import json
 import socket
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -56,6 +58,16 @@ dataset_app = typer.Typer(no_args_is_help=True, rich_markup_mode="rich",
     help="Datasets — [cyan]import[/] (roboflow/local/nas), [cyan]freeze[/] tracking, "
          "list versions, licence approval.")
 admin_app = typer.Typer(no_args_is_help=True, help="Administration: users, tokens, audit (admin only).")
+images_app = typer.Typer(no_args_is_help=True, rich_markup_mode="rich",
+    help="Container images — [cyan]resolve[/] a short ref to a full URL, "
+         "[cyan]validate[/] a ref, [cyan]suggest[/] images for a model, show registry [cyan]config[/]. "
+         "You can pass short refs like [cyan]--image strawberry-detector:v1.0.2[/] to job train/process.")
+templates_app = typer.Typer(no_args_is_help=True, rich_markup_mode="rich",
+    help="Job templates — reusable submit presets ([cyan]list[/], [cyan]show[/], [cyan]rm[/]). "
+         "Start a job from one with [cyan]job create --template <id>[/].")
+init_app = typer.Typer(no_args_is_help=True, rich_markup_mode="rich",
+    help="Scaffold starter projects — [cyan]training-project[/] creates a ready-to-edit "
+         "training repo (Dockerfile, train.py, config.yaml, job template).")
 app.add_typer(job_app, name="job")
 app.add_typer(model_app, name="model")
 app.add_typer(worker_app, name="worker")
@@ -64,6 +76,9 @@ app.add_typer(system_app, name="system")
 app.add_typer(config_app, name="config")
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(admin_app, name="admin")
+app.add_typer(images_app, name="images")
+app.add_typer(templates_app, name="templates")
+app.add_typer(init_app, name="init")
 
 tutorial_app = typer.Typer(no_args_is_help=True, rich_markup_mode="rich",
     help="Guided tutorials for AI engineers (first run, training, inference, GPUs, outputs, troubleshooting).")
@@ -389,6 +404,396 @@ def job_process(ctx: typer.Context,
     _job_process(ctx, model, image, dataset, tenant, config)
 
 
+# --------------------------------------------------------------------------- #
+# images group — resolve short refs so you never paste a full registry URL
+# --------------------------------------------------------------------------- #
+@images_app.command("config")
+def images_config(ctx: typer.Context, out: Optional[str] = OUTPUT_OPT):
+    """Show the registry base and namespace used to expand short image refs."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    output.emit(_client(ctx).get("/registry/config"), g.output, title="registry")
+
+
+@images_app.command("resolve")
+def images_resolve(ctx: typer.Context,
+                   ref: str = typer.Argument(..., help="short ref, e.g. strawberry-detector:v1.0.2"),
+                   model: Optional[str] = typer.Option(None, help="model, so a bare ':tag' resolves to that model's repo"),
+                   out: Optional[str] = OUTPUT_OPT):
+    """Preview the full image URL a short ref expands to (no job submitted)."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    params = {"ref": ref}
+    if model:
+        params["model"] = model
+    res = _client(ctx).get("/registry/resolve", params=params, spinner="resolving…")
+    if g.output == "table":
+        output.success(res["resolved"] or "(blank — API resolves from the model registry)")
+    else:
+        output.emit(res, g.output)
+
+
+@images_app.command("suggest")
+def images_suggest(ctx: typer.Context,
+                   model: str = typer.Argument(..., help="model name"),
+                   job_type: str = typer.Option("training", "--type", help="training or processing"),
+                   out: Optional[str] = OUTPUT_OPT):
+    """Suggest images for a model: its registry default plus recently-used images."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    res = _client(ctx).get("/registry/suggest",
+                           params={"model": model, "job_type": job_type},
+                           spinner="loading suggestions…")
+    if g.output == "table":
+        output.success(f"default: {res.get('default_image') or '(resolves at submit time)'}")
+        recent = res.get("recent_images") or []
+        if recent:
+            output.emit([{"recent_image": r} for r in recent], "table",
+                        columns=[("recent images", "recent_image")])
+        output.info(f"tip: vgreens-ai job train --model {model} "
+                    f"--image {res.get('suggested_ref', model + ':latest')} --dataset <name>:<ver>")
+    else:
+        output.emit(res, g.output)
+
+
+@images_app.command("validate")
+def images_validate(ctx: typer.Context,
+                    ref: str = typer.Argument(..., help="image ref, e.g. strawberry-detector:v1.0.2"),
+                    model: Optional[str] = typer.Option(None, help="model for a bare ':tag'"),
+                    out: Optional[str] = OUTPUT_OPT):
+    """Resolve a ref and sanity-check it before you launch a long job (#3)."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    params = {"ref": ref}
+    if model:
+        params["model"] = model
+    res = _client(ctx).get("/registry/resolve", params=params, spinner="resolving…")
+    resolved = res.get("resolved") or ""
+    # Reuse the API's planning validator via /jobs/plan is overkill; do a light
+    # local check here and show the resolved URL.
+    if g.output == "table":
+        if not resolved:
+            output.warn("blank — the API would resolve this from the model registry")
+        else:
+            output.success(f"resolved: {resolved}")
+            if ":" not in resolved.rsplit("/", 1)[-1]:
+                output.warn("no explicit tag — will default to :latest")
+    else:
+        output.emit({"ref": ref, "resolved": resolved}, g.output)
+
+
+# --------------------------------------------------------------------------- #
+# templates group (#1): reusable submit presets
+# --------------------------------------------------------------------------- #
+TPL_COLS = [("id", "id"), ("name", "name"), ("type", "job_type"),
+            ("image", "docker_image"), ("gpu", "gpu_count"), ("dataset", "dataset_name")]
+
+
+@templates_app.command("list")
+def templates_list(ctx: typer.Context, job_type: str = typer.Option(None, "--type"),
+                   out: Optional[str] = OUTPUT_OPT):
+    """List job templates."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    params = {"job_type": job_type} if job_type else {}
+    res = _client(ctx).get("/templates", params=params, spinner="loading templates…")
+    output.emit(res.get("templates", []), g.output, columns=TPL_COLS, title="templates")
+
+
+@templates_app.command("show")
+def templates_show(ctx: typer.Context, template_id: str = typer.Argument(...),
+                   out: Optional[str] = OUTPUT_OPT):
+    """Show one template."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    output.emit(_client(ctx).get(f"/templates/{template_id}"), g.output, title=template_id)
+
+
+@templates_app.command("rm")
+def templates_rm(ctx: typer.Context, template_id: str = typer.Argument(...)):
+    """Delete a template (built-ins cannot be deleted)."""
+    g: G = ctx.obj
+    res = _client(ctx).delete(f"/templates/{template_id}", spinner="deleting…")
+    if g.output == "table":
+        output.success(f"deleted {template_id}")
+    else:
+        output.emit(res, g.output)
+
+
+@templates_app.command("create")
+def templates_create(ctx: typer.Context,
+                     name: str = typer.Option(..., help="template name"),
+                     job_type: str = typer.Option("training", "--type"),
+                     image: Optional[str] = typer.Option(None, help="short ref or full URL"),
+                     gpu_count: int = typer.Option(1, "--gpu-count"),
+                     dataset: Optional[str] = typer.Option(None, help="default dataset name"),
+                     description: Optional[str] = typer.Option(None)):
+    """Create a job template from flags."""
+    g: G = ctx.obj
+    body = {"name": name, "job_type": job_type, "docker_image": image,
+            "gpu_count": gpu_count, "dataset_name": dataset, "description": description}
+    res = _client(ctx).post("/templates", json=body, spinner="creating template…")
+    if g.output == "table":
+        output.success(f"created {res.get('id')}")
+    else:
+        output.emit(res, g.output)
+
+
+# --------------------------------------------------------------------------- #
+# init training-project (#16): scaffold a ready-to-edit training repo
+# --------------------------------------------------------------------------- #
+_INIT_TRAIN_PY = '''\
+"""Training entrypoint — platform contract.
+
+Reads /data (read-only) + /config/job.yaml, writes /out/model.pt,
+/out/eval/metrics.json and one JSON line per epoch to /out/metrics.jsonl
+(the platform shows live progress from that file). Replace the marked block
+with your real model + training loop.
+"""
+import json, os, time
+from pathlib import Path
+
+OUT = Path("/out"); DATA = Path("/data"); CONFIG = Path("/config/job.yaml")
+
+
+def _progress(**row):
+    row.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%S"))
+    with open(OUT / "metrics.jsonl", "a") as fh:
+        fh.write(json.dumps(row) + "\\n")
+
+
+def main() -> int:
+    for d in ("eval", "artifacts", "predictions"):
+        (OUT / d).mkdir(parents=True, exist_ok=True)
+    cfg = {}
+    if CONFIG.is_file():
+        try:
+            import yaml; cfg = yaml.safe_load(CONFIG.read_text()) or {}
+        except Exception:
+            cfg = {}
+    epochs = int((cfg.get("train") or {}).get("epochs", 10))
+
+    # ===== REPLACE: your real training loop =====
+    accuracy = 0.0
+    for ep in range(1, epochs + 1):
+        accuracy = ep / epochs
+        _progress(epoch=ep, total_epochs=epochs, accuracy=round(accuracy, 4))
+    (OUT / "model.pt").write_bytes(b"REPLACE_WITH_REAL_WEIGHTS")
+    # ============================================
+
+    (OUT / "eval" / "metrics.json").write_text(json.dumps({"accuracy": round(accuracy, 4)}))
+    (OUT / "report.json").write_text(json.dumps(
+        {"model": os.environ.get("MODEL_NAME", "model"), "epochs": epochs,
+         "metrics": {"accuracy": round(accuracy, 4)}}, indent=2))
+    print(f"[train] done, accuracy={accuracy}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+_INIT_DOCKERFILE = '''\
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+ENTRYPOINT ["python", "/app/train.py"]
+'''
+
+_INIT_CONFIG = '''\
+# Hyperparameters read by train.py (edit freely).
+train:
+  epochs: 50
+  batch_size: 16
+  learning_rate: 0.001
+  image_size: 640
+  gpus: 1
+thresholds:      # validation gate: minimums the result must meet to pass
+  accuracy: 0.5
+'''
+
+_INIT_REQS = "pyyaml\n"
+
+_INIT_JOB_TEMPLATE = '''\
+# .vgreens/job-template.yaml — defaults for `vgreens-ai job create --template`.
+name: my-training
+job_type: training
+gpu_count: 1
+# docker_image: my-model:latest    # short ref; resolved to the full registry URL
+# dataset_name: my-dataset
+'''
+
+_INIT_README = '''\
+# {name}
+
+A vGreens training project scaffold.
+
+## Layout
+- `train.py` — training entrypoint (writes model.pt + metrics.json + metrics.jsonl).
+- `Dockerfile` — how the training image is built.
+- `config.yaml` — hyperparameters + validation thresholds.
+- `.vgreens/job-template.yaml` — defaults for `vgreens-ai job create`.
+
+## Build & run
+1. Edit the REPLACE block in `train.py` with your real training loop.
+2. Build + push the image via CI (or `docker build -t <image> .`).
+3. Submit: `vgreens-ai job create --interactive` (or `job train --model <m> --image <img> --dataset <d>:v1`).
+'''
+
+
+@init_app.command("training-project")
+def init_training_project(
+        directory: str = typer.Argument(".", help="target directory"),
+        name: str = typer.Option("my-training", help="project name"),
+        force: bool = typer.Option(False, "--force", help="write into a non-empty dir")):
+    """Scaffold a ready-to-edit training repo (Dockerfile, train.py, config, template)."""
+    root = Path(directory).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    existing = [p for p in root.iterdir()] if root.is_dir() else []
+    if existing and not force:
+        output.error(f"{root} is not empty — use --force to write anyway"); raise typer.Exit(2)
+    files = {
+        "train.py": _INIT_TRAIN_PY,
+        "Dockerfile": _INIT_DOCKERFILE,
+        "config.yaml": _INIT_CONFIG,
+        "requirements.txt": _INIT_REQS,
+        ".vgreens/job-template.yaml": _INIT_JOB_TEMPLATE,
+        "README.md": _INIT_README.format(name=name),
+    }
+    for rel, content in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    output.success(f"scaffolded training project in {root}")
+    for rel in files:
+        output.info(f"  {rel}")
+    output.info("next: edit the REPLACE block in train.py, then build + submit.")
+
+
+# --------------------------------------------------------------------------- #
+# job create (interactive builder, #17) + plan (#6/#14/#15) + clone (#10)
+# --------------------------------------------------------------------------- #
+def _print_plan(plan: dict) -> None:
+    """Render a /jobs/plan result: checks, recommended GPU, command preview."""
+    from rich.table import Table
+    tbl = Table(title="pre-flight checks", show_header=True)
+    tbl.add_column("check"); tbl.add_column("status"); tbl.add_column("detail")
+    icon = {"ok": "[green]✓ ok[/]", "warning": "[yellow]! warn[/]", "error": "[red]✗ error[/]"}
+    for c in plan.get("checks", []):
+        tbl.add_row(c["name"], icon.get(c["status"], c["status"]), c.get("detail", ""))
+    output.err.print(tbl)
+    adv = plan.get("gpu_advice", {})
+    if adv:
+        output.info(f"recommended GPU: {adv.get('recommended_gpu')} — {adv.get('reason','')}")
+    output.info(f"resolved image: {plan.get('resolved_image') or '(from registry)'}")
+    output.info(f"output path: {plan.get('output_path_preview')}")
+    output.err.print("[dim]command preview:[/]\n" + (plan.get("command_preview") or ""))
+
+
+@job_app.command("plan")
+def job_plan(ctx: typer.Context,
+             model: str = typer.Option(..., help="model name"),
+             job_type: str = typer.Option("training", "--type"),
+             dataset: str = typer.Option(None, help="name:version"),
+             image: Optional[str] = typer.Option(None),
+             gpu_count: int = typer.Option(1, "--gpu-count"),
+             out: Optional[str] = OUTPUT_OPT):
+    """Dry-run pre-flight: checks, recommended GPU, resolved image, command preview (#6/#14/#15)."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    name, _, version = (dataset or "").partition(":")
+    body = {"job_type": job_type, "model_name": model, "gpu_count": gpu_count,
+            "docker_image": image, "dataset_name": name or None,
+            "dataset_version": version or None}
+    plan = _client(ctx).post("/jobs/plan", json=body, spinner="planning…")
+    if g.output == "table":
+        _print_plan(plan)
+    else:
+        output.emit(plan, g.output)
+
+
+@job_app.command("create")
+def job_create(ctx: typer.Context,
+               template: Optional[str] = typer.Option(None, help="start from a template id"),
+               model: Optional[str] = typer.Option(None),
+               job_type: Optional[str] = typer.Option(None, "--type"),
+               dataset: Optional[str] = typer.Option(None, help="name:version"),
+               image: Optional[str] = typer.Option(None),
+               gpu_count: Optional[int] = typer.Option(None, "--gpu-count"),
+               priority: int = typer.Option(0),
+               yes: bool = typer.Option(False, "--yes", help="skip the confirm prompt")):
+    """Interactive job builder — asks what it needs, runs pre-flight, then submits (#17)."""
+    g: G = ctx.obj
+    c = _client(ctx)
+    tpl = c.get(f"/templates/{template}") if template else {}
+
+    def ask(label, default=None):
+        if yes or not sys.stdin.isatty():
+            return default
+        return typer.prompt(label, default=default if default is not None else "")
+
+    job_type = job_type or tpl.get("job_type") or ask("Job type (training/processing)", "training")
+    model = model or ask("Model name", tpl.get("model_name"))
+    if not model:
+        output.error("model is required"); raise typer.Exit(2)
+    if image is None:
+        image = tpl.get("docker_image") or (ask("Docker image (blank = registry)", "") or None)
+    if gpu_count is None:
+        gpu_count = int(tpl.get("gpu_count") or (ask("GPU count", "1") if job_type == "training" else 1))
+    if dataset is None and job_type == "training":
+        dsn = tpl.get("dataset_name") or ""
+        dataset = ask("Dataset (name:version)", dsn)
+    name, _, version = (dataset or "").partition(":")
+
+    body = {"job_type": job_type, "model_name": model, "gpu_count": gpu_count,
+            "priority": priority, "docker_image": image,
+            "dataset_name": name or None, "dataset_version": version or None}
+
+    # Pre-flight before submit so nothing fails 10s in.
+    try:
+        plan = c.post("/jobs/plan", json={k: v for k, v in body.items() if k != "priority"},
+                      spinner="pre-flight…")
+        if g.output == "table":
+            _print_plan(plan)
+        if not plan.get("ok") and not yes and sys.stdin.isatty():
+            typer.confirm("Pre-flight found errors. Submit anyway?", abort=True)
+    except Exception as exc:  # noqa: BLE001 — planning is advisory, never blocks
+        output.warn(f"pre-flight skipped: {exc}")
+
+    if not yes and sys.stdin.isatty():
+        typer.confirm(f"Submit {job_type} job for '{model}'?", abort=True)
+    _submit(ctx, body)
+
+
+@job_app.command("clone")
+def job_clone(ctx: typer.Context,
+              job_id: str = typer.Argument(..., help="job to clone"),
+              dataset: Optional[str] = typer.Option(None, help="override name:version"),
+              image: Optional[str] = typer.Option(None, help="override image"),
+              gpu_count: Optional[int] = typer.Option(None, "--gpu-count"),
+              submit: bool = typer.Option(False, "--submit", help="submit immediately"),
+              out: Optional[str] = OUTPUT_OPT):
+    """Clone an existing job (optionally with tweaks) and re-run it (#10)."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    c = _client(ctx)
+    body = c.get(f"/jobs/{job_id}/clone", spinner="loading job…")
+    if dataset is not None:
+        name, _, version = dataset.partition(":")
+        body["dataset_name"] = name or None
+        body["dataset_version"] = version or None
+    if image is not None:
+        body["docker_image"] = image
+    if gpu_count is not None:
+        body["gpu_count"] = gpu_count
+    if not submit:
+        output.emit(body, g.output, title=f"clone of {job_id} (use --submit to run)")
+        return
+    _submit(ctx, body)
+
+
 @job_app.command("list")
 def job_list(ctx: typer.Context,
              status: str = typer.Option(None), job_type: str = typer.Option(None, "--type"),
@@ -404,6 +809,56 @@ def job_show(ctx: typer.Context, job_id: str = typer.Argument(...), out: Optiona
     """Show one job."""
     _mode(ctx, out)
     _job_show(ctx, job_id)
+
+
+@job_app.command("progress")
+def job_progress(ctx: typer.Context, job_id: str = typer.Argument(...),
+                 out: Optional[str] = OUTPUT_OPT):
+    """Show live training progress (epochs/metrics/ETA) from metrics.jsonl (#7)."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    res = _client(ctx).get(f"/jobs/{job_id}/progress", spinner="loading progress…")
+    if g.output != "table":
+        output.emit(res, g.output); return
+    if not res.get("available"):
+        output.info(f"no progress yet (status: {res.get('status')})"); return
+    cur, total = res.get("current_epoch"), res.get("total_epochs")
+    eta = res.get("eta_seconds")
+    output.success(f"epoch {cur}/{total}" + (f" — ETA {output.fmt_duration(eta)}" if eta else ""))
+    latest = res.get("latest") or {}
+    metrics = {k: v for k, v in latest.items()
+               if k not in ("epoch", "total_epochs", "ts", "stage", "world_size")}
+    if metrics:
+        output.emit(metrics, "table", title="latest metrics")
+
+
+@job_app.command("explain")
+def job_explain(ctx: typer.Context, job_id: str = typer.Argument(...),
+                out: Optional[str] = OUTPUT_OPT):
+    """Explain why a job failed, with suggested fixes (#9)."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    res = _client(ctx).get(f"/jobs/{job_id}/explain", spinner="analysing…")
+    if g.output != "table":
+        output.emit(res, g.output); return
+    output.warn(res.get("cause", ""))
+    for s in res.get("suggestions", []):
+        output.info(f"  • {s}")
+
+
+@job_app.command("report")
+def job_report(ctx: typer.Context, job_id: str = typer.Argument(...),
+               save: Optional[str] = typer.Option(None, help="write the report JSON to a file"),
+               out: Optional[str] = OUTPUT_OPT):
+    """Fetch the standard job report; optionally save it as JSON (#19)."""
+    _mode(ctx, out)
+    g: G = ctx.obj
+    res = _client(ctx).get(f"/jobs/{job_id}/report", spinner="building report…")
+    if save:
+        Path(save).write_text(json.dumps(res, indent=2))
+        output.success(f"wrote {save}")
+        return
+    output.emit(res, g.output, title=f"report {job_id}")
 
 
 @job_app.command("events")

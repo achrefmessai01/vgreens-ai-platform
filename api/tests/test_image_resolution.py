@@ -127,3 +127,69 @@ def test_training_no_frozen_version_422():
                                    "dataset_name": "never_frozen_ds"})   # no versions
     assert r.status_code == 422, r.text
     assert "frozen version" in r.json()["detail"]
+
+
+# ── Registry image helper endpoints (short-ref selector; no token exposed) ────
+def test_registry_config_endpoint():
+    _login()
+    r = client.get("/registry/config")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"registry_base", "namespace"}
+    # never leak a secret through this endpoint
+    assert not any("token" in k or "secret" in k or "password" in k for k in body)
+
+
+def test_registry_resolve_short_ref():
+    _login()
+    base = client.get("/registry/config").json()
+    r = client.get("/registry/resolve", params={"ref": "strawberry-detector:v1.0.2"})
+    assert r.status_code == 200, r.text
+    assert r.json()["resolved"] == \
+        f"{base['registry_base']}/{base['namespace']}/strawberry-detector:v1.0.2"
+
+
+def test_registry_resolve_bare_name_defaults_latest():
+    _login()
+    base = client.get("/registry/config").json()
+    r = client.get("/registry/resolve", params={"ref": "strawberry-detector"})
+    assert r.json()["resolved"].endswith("/strawberry-detector:latest")
+
+
+def test_registry_resolve_full_ref_unchanged():
+    _login()
+    full = "registry.vgreens.lan:9443/vgreens-models/x:1"
+    r = client.get("/registry/resolve", params={"ref": full})
+    assert r.json()["resolved"] == full
+
+
+def test_registry_resolve_colon_tag_with_model():
+    _login()
+    base = client.get("/registry/config").json()
+    r = client.get("/registry/resolve", params={"ref": ":v9", "model": "berry"})
+    assert r.json()["resolved"] == f"{base['registry_base']}/{base['namespace']}/berry:v9"
+
+
+def test_registry_suggest_shape_and_recent():
+    _seed("suggestme", "v1", "registry.vgreens.lan/vgreens-models/suggestme:v1", active=True)
+    _login()
+    # a submitted job becomes a "recent image" for this model
+    client.post("/jobs", json={"job_type": "processing", "model_name": "suggestme",
+                               "docker_image": "custom/thing:x"})
+    r = client.get("/registry/suggest", params={"model": "suggestme", "job_type": "processing"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["model"] == "suggestme"
+    assert body["suggested_ref"] == "suggestme:latest"
+    assert "registry_base" in body and "namespace" in body
+    assert "custom/thing:x" in body["recent_images"]
+    # no secret material ever returned
+    assert not any("token" in k or "secret" in k for k in body)
+
+
+def test_registry_endpoints_require_auth():
+    client.cookies.clear()
+    for path, params in [("/registry/config", {}),
+                         ("/registry/resolve", {"ref": "x"}),
+                         ("/registry/suggest", {"model": "berry"})]:
+        assert client.get(path, params=params).status_code in (401, 403)

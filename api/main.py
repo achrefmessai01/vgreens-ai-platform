@@ -38,6 +38,7 @@ import broker as jobqueue
 import models_registry as reg
 import authn
 import notify
+import job_planning as planning
 from auth import require_token
 
 # Base URL used for deep-links inside notification emails.
@@ -52,6 +53,44 @@ NAS_DATASETS_ROOT = os.environ.get("NAS_DATASETS", "/mnt/vgreens_storage/ai/data
 NAS_JOB_CONFIGS_ROOT = os.environ.get("NAS_JOB_CONFIGS", "/mnt/vgreens_storage/ai/job-configs")
 
 _CONFIG_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,62}$")
+
+# ── Container registry (image short-ref resolution) ──────────────────────────
+# So engineers never copy-paste the full registry URL: a short ref like
+# "strawberry-detector:v1.0.2" (or just "strawberry-detector") is expanded to
+# "<REGISTRY_BASE>/<REGISTRY_NAMESPACE>/strawberry-detector:v1.0.2". A ref that
+# already carries a registry host (contains '.'/':' in its first path segment,
+# or "localhost") is treated as a full ref and passed through unchanged
+# (advanced / custom-image mode). No registry token is ever involved here or
+# exposed to clients — this is pure string resolution.
+REGISTRY_BASE = os.environ.get("VG_REGISTRY_BASE", "registry.gitlab.com").rstrip("/")
+REGISTRY_NAMESPACE = os.environ.get("VG_REGISTRY_NAMESPACE", "vgreens-models").strip("/")
+
+
+def expand_image_ref(ref: str, model: str | None = None) -> str:
+    """Expand a short, single-segment image ref into a full registry URL.
+
+    Conservative on purpose — only a bare ``name`` / ``name:tag`` (or a leading
+    ``:tag`` together with the model name) is expanded to
+    ``BASE/NS/name:(tag|latest)``. Anything that already contains a ``/`` is
+    treated as an explicit reference and returned unchanged (it already names a
+    namespace or registry, including Docker Hub images), so an explicit image
+    always wins. Idempotent; no registry token involved.
+
+    "" -> ""                          (caller resolves from the model registry)
+    "name" / "name:tag"    -> BASE/NS/name:(tag|latest)
+    ":tag" (+ model)       -> BASE/NS/model:tag
+    "ns/name[:tag]", "host/ns/name:tag" -> unchanged
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return ""
+    if ref.startswith(":") and model:        # ":tag" -> the model's repo at tag
+        ref = f"{model}{ref}"
+    if "/" in ref:                           # already explicit/full -> leave as-is
+        return ref
+    if ":" not in ref:                       # ensure an explicit tag
+        ref += ":latest"
+    return f"{REGISTRY_BASE}/{REGISTRY_NAMESPACE}/{ref}"
 
 VERSION = "0.2.0"        # API version (bumped for Phase 3 additive endpoints)
 API_LEVEL = "v1"         # wire-compat level; bump only on breaking changes
@@ -157,6 +196,29 @@ class RollbackBody(BaseModel):
     reason: Optional[str] = None
 
 
+class TemplateBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    description: Optional[str] = None
+    job_type: Literal["training", "processing"]
+    docker_image: Optional[str] = None
+    gpu_count: int = 1
+    dataset_name: Optional[str] = None
+    config_yaml: Optional[str] = None
+    defaults: Optional[dict] = None      # extra CreateJob fields (tenant, model_version…)
+
+
+class ConfigGenBody(BaseModel):
+    epochs: Optional[int] = None
+    batch_size: Optional[int] = None
+    learning_rate: Optional[float] = None
+    image_size: Optional[int] = None
+    optimizer: Optional[str] = None
+    augment: Optional[bool] = None
+    gpus: Optional[int] = None
+    model_architecture: Optional[str] = None
+    thresholds: Optional[dict] = None
+
+
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
@@ -235,6 +297,49 @@ def _write_nas_snapshot(job: dict) -> str:
     return str(folder)
 
 
+def _predicted_output_path(job_type: str) -> str:
+    """The NAS folder a job WOULD get (auto-generated, unique per job) — shown in
+    the pre-submit plan so engineers see where outputs land. Mirrors
+    _write_nas_snapshot's scheme without creating anything."""
+    year = datetime.now(timezone.utc).strftime("%Y")
+    return str(Path(NAS_JOBS_ROOT) / year / f"<{job_type}_job_id>")
+
+
+def _worker_online_count() -> tuple[int, int]:
+    """(online, total) workers, using the same 90s heartbeat window as monitoring."""
+    workers = db.list_workers()
+    online = 0
+    for w in workers:
+        ls = w.get("last_seen")
+        if not ls:
+            continue
+        try:
+            age = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(ls)).total_seconds()
+            if age < 90:
+                online += 1
+        except (ValueError, TypeError):
+            continue
+    return online, len(workers)
+
+
+def _dataset_image_count(name: Optional[str], version: Optional[str]) -> Optional[int]:
+    if not name:
+        return None
+    try:
+        if version:
+            dv = db.get_dataset_version(name, version)
+            return (dv or {}).get("image_count")
+        vs = db.list_dataset_versions(name)
+        return vs[0].get("image_count") if vs else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _check(name: str, ok: bool, detail: str, level_if_fail: str = "error") -> dict:
+    return {"name": name, "status": "ok" if ok else level_if_fail, "detail": detail}
+
+
 # --------------------------------------------------------------------------- #
 # routes
 # --------------------------------------------------------------------------- #
@@ -267,7 +372,9 @@ def create_job(req: JobRequest,
             dataset_version = versions[0]["version"]
     # Resolve the container image. If the caller left it blank, reuse the
     # model's registry image (processing -> active version; training -> latest).
-    image = (req.docker_image or "").strip()
+    # Accept a short ref (e.g. "strawberry-detector:v1.0.2") and expand it to the
+    # full registry URL, so callers never need to paste the whole path.
+    image = expand_image_ref((req.docker_image or "").strip(), req.model_name)
     if not image:
         image = reg.resolve_image(req.model_name, req.job_type, req.model_version)
         if not image:
@@ -328,6 +435,361 @@ def read_job(job_id: str, _: str = Depends(authn.actor("viewer"))) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+# --------------------------------------------------------------------------- #
+# job planning: pre-flight checks (#6), image validation (#3), recommended GPU
+# (#15), docker command preview (#14), output-path preview (#18). One read-only
+# endpoint the CLI/web call BEFORE submitting so nothing fails 10s into a run.
+# --------------------------------------------------------------------------- #
+@app.post("/jobs/plan")
+def plan_job(req: JobRequest,
+             ident: Optional[authn.Identity] = Depends(authn.current_identity)) -> dict:
+    if ident is None:
+        raise HTTPException(status_code=401, detail="authentication required")
+    if not authn.role_at_least(ident.role, "operator"):
+        raise HTTPException(status_code=403, detail="requires 'operator' role or higher")
+
+    checks: list[dict] = []
+
+    # Resolve dataset version (training) — non-raising, reported as a check.
+    dataset_version = req.dataset_version
+    if req.job_type == "training":
+        if not req.dataset_name:
+            checks.append(_check("dataset", False, "training requires a dataset_name"))
+        else:
+            versions = []
+            try:
+                versions = db.list_dataset_versions(req.dataset_name)
+            except Exception:  # noqa: BLE001
+                versions = []
+            if not versions:
+                checks.append(_check("dataset", False,
+                    f"no frozen version for dataset '{req.dataset_name}' — import & freeze first"))
+            else:
+                if not dataset_version:
+                    dataset_version = versions[0]["version"]
+                have = any(v["version"] == dataset_version for v in versions)
+                checks.append(_check("dataset", have,
+                    f"{req.dataset_name}:{dataset_version}" + ("" if have else " not frozen")))
+
+    # Resolve the image (short ref -> full URL, else from the registry).
+    image = expand_image_ref((req.docker_image or "").strip(), req.model_name)
+    if not image:
+        image = reg.resolve_image(req.model_name, req.job_type, req.model_version) or ""
+    if image:
+        vr = planning.validate_image_ref(image)
+        checks.append(_check("image", vr["ok"], f"{image} — {vr['detail']}",
+                             level_if_fail="warning"))
+    else:
+        checks.append(_check("image", False,
+            f"no image provided and none resolvable for model '{req.model_name}'"))
+
+    # System-state checks.
+    nas_ok = False
+    try:
+        nas_ok = os.path.ismount(NAS_MOUNTPOINT) or Path(NAS_MOUNTPOINT).is_dir()
+    except Exception:  # noqa: BLE001
+        nas_ok = False
+    checks.append(_check("nas_mounted", nas_ok,
+                         f"{NAS_MOUNTPOINT}" + ("" if nas_ok else " not mounted")))
+
+    online, total = _worker_online_count()
+    checks.append(_check("worker_online", online > 0,
+                         f"{online}/{total} worker(s) online"))
+
+    # Disk space on the NAS root (best-effort).
+    try:
+        usage = shutil.disk_usage(NAS_MOUNTPOINT)
+        free_gb = usage.free / (1024 ** 3)
+        checks.append(_check("disk_space", free_gb > 5,
+                             f"{free_gb:.1f} GiB free", level_if_fail="warning"))
+    except Exception:  # noqa: BLE001
+        checks.append(_check("disk_space", True, "could not determine free space",
+                             level_if_fail="warning"))
+
+    # GPU availability vs requested.
+    gpu_ok = online > 0
+    checks.append(_check("gpu", gpu_ok,
+        f"requested {req.gpu_count} GPU(s)" + ("" if gpu_ok else " — no worker online"),
+        level_if_fail="warning"))
+
+    img_count = _dataset_image_count(req.dataset_name, dataset_version)
+    advice = planning.recommend_gpu(req.job_type, img_count, req.gpu_count)
+
+    preview_job = {
+        "job_id": None, "job_type": req.job_type, "model_name": req.model_name,
+        "model_version": req.model_version, "dataset_name": req.dataset_name,
+        "dataset_version": dataset_version, "tenant": req.tenant,
+        "docker_image": image or "<unresolved>", "gpu_count": req.gpu_count,
+    }
+
+    has_error = any(c["status"] == "error" for c in checks)
+    return {
+        "ok": not has_error,
+        "resolved_image": image,
+        "dataset_version": dataset_version,
+        "output_path_preview": _predicted_output_path(req.job_type),
+        "command_preview": planning.build_command_preview(preview_job),
+        "recommended_gpu": advice["recommended_gpu"],
+        "gpu_advice": advice,
+        "checks": checks,
+    }
+
+
+@app.post("/config/generate")
+def generate_config(body: ConfigGenBody, _: str = Depends(authn.actor("operator"))) -> dict:
+    """Generate a job.yaml body from hyperparameters (config generator, #5)."""
+    yaml_text = planning.generate_config_yaml(body.model_dump(exclude_none=True))
+    return {"yaml": yaml_text}
+
+
+@app.get("/jobs/{job_id}/clone")
+def clone_job(job_id: str, _: str = Depends(authn.actor("viewer"))) -> dict:
+    """Return a CreateJob-shaped body pre-filled from an existing job so the
+    caller can resubmit it (optionally with tweaks). No side effects (#10)."""
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {
+        "job_type": job["job_type"],
+        "model_name": job["model_name"],
+        "docker_image": job.get("docker_image"),
+        "model_version": job.get("result_version"),
+        "dataset_name": job.get("dataset_name"),
+        "dataset_version": job.get("dataset_version"),
+        "tenant": job.get("tenant"),
+        "config_path": job.get("config_path"),
+        "priority": job.get("priority") or 0,
+        "gpu_count": job.get("gpu_count") or 1,
+    }
+
+
+@app.get("/jobs/{job_id}/progress")
+def job_progress(job_id: str, _: str = Depends(authn.actor("viewer"))) -> dict:
+    """Live training progress parsed from <out>/metrics.jsonl (#7)."""
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    base = _job_out_dir(job)
+    mf = (base / "metrics.jsonl") if base else None
+    if mf is None or not mf.is_file():
+        return {"available": False, "epochs": [], "latest": None,
+                "current_epoch": None, "total_epochs": None, "eta_seconds": None,
+                "status": job["status"]}
+    try:
+        text = mf.read_text(errors="replace")
+    except OSError:
+        text = ""
+    out = planning.parse_progress(text)
+    out["status"] = job["status"]
+    return out
+
+
+@app.get("/jobs/{job_id}/explain")
+def explain_job(job_id: str, _: str = Depends(authn.actor("viewer"))) -> dict:
+    """Rule-based explanation of why a job failed, with suggested fixes (#9)."""
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    log_tail: list[str] = []
+    op = job.get("output_path")
+    logf = Path(op) / "logs" / "container.log" if op else None
+    if logf and logf.is_file():
+        try:
+            log_tail = logf.read_text(errors="replace").splitlines()[-40:]
+        except OSError:
+            log_tail = []
+    exp = planning.explain_failure(job.get("error"), log_tail)
+    exp["job_status"] = job["status"]
+    return exp
+
+
+@app.get("/jobs/{job_id}/report")
+def job_report(job_id: str, _: str = Depends(authn.actor("viewer"))) -> dict:
+    """Standard, traceable job report (#19). JSON; the web app renders + exports
+    it as HTML/PDF, and the CLI can save the JSON directly."""
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    result = read_job_result(job_id)  # reuse the existing metrics/artifacts reader
+    return planning.assemble_report(job, result)
+
+
+@app.get("/experiments/compare")
+def compare_jobs(ids: str = Query(..., min_length=1),
+                 _: str = Depends(authn.actor("viewer"))) -> dict:
+    """Side-by-side comparison of several runs' metadata + metrics (#11).
+    `ids` is a comma-separated list of job ids. (Path avoids colliding with the
+    dynamic /jobs/{job_id} route.)"""
+    wanted = [i.strip() for i in ids.split(",") if i.strip()][:10]
+    runs = []
+    for jid in wanted:
+        job = db.get_job(jid)
+        if job is None:
+            runs.append({"job_id": jid, "found": False})
+            continue
+        res = read_job_result(jid)
+        runs.append({
+            "job_id": jid, "found": True, "job_type": job["job_type"],
+            "model_name": job["model_name"], "status": job["status"],
+            "dataset_name": job.get("dataset_name"),
+            "dataset_version": job.get("dataset_version"),
+            "gpu_count": job.get("gpu_count"), "created_at": job.get("created_at"),
+            "started_at": job.get("started_at"), "finished_at": job.get("finished_at"),
+            "result_version": job.get("result_version"),
+            "metrics": res.get("metrics") or (res.get("report") or {}),
+        })
+    return {"runs": runs}
+
+
+@app.get("/jobs/{job_id}/logs/stream")
+async def stream_job_logs(job_id: str, _: str = Depends(authn.actor("viewer"))):
+    """Server-Sent-Events tail of a running job's container.log (#8). Sends the
+    current tail, then new lines as they are written, until the job is terminal."""
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    op = job.get("output_path")
+    logf = Path(op) / "logs" / "container.log" if op else None
+
+    async def gen():
+        pos = 0
+        # initial tail (last ~200 lines)
+        if logf and logf.is_file():
+            try:
+                existing = logf.read_text(errors="replace").splitlines()
+                for ln in existing[-200:]:
+                    yield f"data: {ln}\n\n"
+                pos = logf.stat().st_size
+            except OSError:
+                pass
+        idle = 0
+        while True:
+            await asyncio.sleep(1.0)
+            cur = db.get_job(job_id) or {}
+            new_text = ""
+            if logf and logf.is_file():
+                try:
+                    with open(logf, "r", errors="replace") as fh:
+                        fh.seek(pos)
+                        new_text = fh.read()
+                        pos = fh.tell()
+                except OSError:
+                    new_text = ""
+            if new_text:
+                for ln in new_text.splitlines():
+                    yield f"data: {ln}\n\n"
+                idle = 0
+            else:
+                idle += 1
+            if cur.get("status") in ("succeeded", "failed", "cancelled"):
+                yield f"event: end\ndata: {cur.get('status')}\n\n"
+                return
+            if idle > 900:   # ~15 min with no output and not terminal: stop
+                yield "event: end\ndata: idle-timeout\n\n"
+                return
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# --------------------------------------------------------------------------- #
+# job templates (#1): reusable submit presets
+# --------------------------------------------------------------------------- #
+@app.get("/templates")
+def list_templates(job_type: Optional[str] = None,
+                   _: str = Depends(authn.actor("viewer"))) -> dict:
+    return {"templates": db.list_templates(job_type)}
+
+
+@app.post("/templates", status_code=201)
+def create_template(body: TemplateBody, who: str = Depends(authn.actor("operator"))) -> dict:
+    if body.gpu_count not in (1, 2):
+        raise HTTPException(status_code=422, detail="gpu_count must be 1 or 2")
+    tpl = {
+        "id": f"tpl_{secrets.token_hex(4)}",
+        "name": body.name.strip(),
+        "description": (body.description or "").strip() or None,
+        "job_type": body.job_type,
+        "docker_image": (body.docker_image or "").strip() or None,
+        "gpu_count": body.gpu_count,
+        "dataset_name": (body.dataset_name or "").strip() or None,
+        "config_yaml": body.config_yaml,
+        "defaults": json.dumps(body.defaults) if body.defaults else None,
+        "builtin": 0,
+        "created_by": who,
+        "created_at": db.now_iso(),
+    }
+    db.insert_template(tpl)
+    db.add_audit(who, "template.create", tpl["id"], source="api")
+    return db.get_template(tpl["id"])
+
+
+@app.get("/templates/{template_id}")
+def read_template(template_id: str, _: str = Depends(authn.actor("viewer"))) -> dict:
+    tpl = db.get_template(template_id)
+    if tpl is None:
+        raise HTTPException(status_code=404, detail="template not found")
+    return tpl
+
+
+@app.delete("/templates/{template_id}")
+def remove_template(template_id: str, who: str = Depends(authn.actor("operator"))) -> dict:
+    tpl = db.get_template(template_id)
+    if tpl is None:
+        raise HTTPException(status_code=404, detail="template not found")
+    if tpl.get("builtin"):
+        raise HTTPException(status_code=409, detail="cannot delete a built-in template")
+    db.delete_template(template_id)
+    db.add_audit(who, "template.delete", template_id, source="api")
+    return {"deleted": True, "id": template_id}
+
+
+# ── Registry image helpers (so clients never paste full image URLs) ──────────
+@app.get("/registry/config")
+def registry_config(_: str = Depends(authn.actor("viewer"))) -> dict:
+    """Safe registry metadata for building short refs. No token is exposed."""
+    return {"registry_base": REGISTRY_BASE, "namespace": REGISTRY_NAMESPACE}
+
+
+@app.get("/registry/resolve")
+def registry_resolve(ref: str = "", model: Optional[str] = None,
+                     _: str = Depends(authn.actor("viewer"))) -> dict:
+    """Preview how a short image ref expands to a full registry URL."""
+    return {"ref": ref, "resolved": expand_image_ref(ref, model)}
+
+
+@app.get("/registry/suggest")
+def registry_suggest(model: str, job_type: str = "training",
+                     _: str = Depends(authn.actor("viewer"))) -> dict:
+    """Image suggestions for a model, from safe local sources only:
+
+    - default_image: the registry image already recorded for this model
+      (active version for processing, else latest), if any;
+    - recent_images: distinct images this model was recently submitted with
+      (from the local job history) — newest first;
+    - registry_base / namespace: so the UI can build BASE/NS/<model>:<tag>.
+    No container-registry token is used or returned.
+    """
+    default_image = reg.resolve_image(model, job_type) or ""
+    recent: list[str] = []
+    try:
+        for j in db.list_jobs(model=model, limit=50):
+            img = (j.get("docker_image") or "").strip()
+            if img and img not in recent:
+                recent.append(img)
+            if len(recent) >= 6:
+                break
+    except Exception:  # noqa: BLE001 — suggestions are best-effort, never fatal
+        recent = []
+    return {
+        "model": model,
+        "default_image": default_image,
+        "recent_images": recent,
+        "suggested_ref": f"{model}:latest",
+        "registry_base": REGISTRY_BASE,
+        "namespace": REGISTRY_NAMESPACE,
+    }
 
 
 @app.get("/jobs/{job_id}/events")
