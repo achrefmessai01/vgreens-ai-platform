@@ -118,6 +118,33 @@ def _model_class(variant):
     return getattr(rfdetr, name, rfdetr.RFDETRBase)
 
 
+def _versions():
+    """Library versions this run used — recorded in report.json so results are
+    reproducible (e.g. an RF-DETR version bump can change detections)."""
+    import importlib.metadata as _md
+    out = {}
+    for pkg in ("rfdetr", "torch", "torchvision", "supervision", "transformers"):
+        try:
+            out[pkg] = _md.version(pkg)
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _dataset_classes(ds_root):
+    """Class names + count from the dataset's data.yaml, so the index->name map
+    travels with the result (YOLO is 0-indexed; don't trust bare numeric ids)."""
+    try:
+        doc = yaml.safe_load((ds_root / "data.yaml").read_text()) or {}
+        names = doc.get("names")
+        if isinstance(names, dict):            # {0: 'a', 1: 'b'} -> ordered list
+            names = [names[k] for k in sorted(names)]
+        return {"names": names, "num_classes": doc.get("nc"),
+                "dataset_format": "yolo"}
+    except Exception:  # noqa: BLE001
+        return {"names": None, "num_classes": None, "dataset_format": "yolo"}
+
+
 def _yolo_ground_truth(label_path, w, h):
     """Build an sv.Detections from a YOLO label file (normalized cx cy bw bh)."""
     import numpy as np
@@ -138,13 +165,66 @@ def _yolo_ground_truth(label_path, w, h):
                          class_id=np.array(classes, dtype=int))
 
 
-def _compute_metrics(ckpt, ds_root, variant):
-    """Best-effort mAP over the val split using RF-DETR + supervision.
-
-    Returns a dict with mAP50/mAP50-95. On any failure returns zeros plus a note
-    (this path can only be exercised on a GPU host) so the pipeline still writes a
-    valid metrics.json.
+def _metrics_from_csv():
+    """Read the val mAP RF-DETR already logged to /out/runs/metrics.csv and
+    return the best epoch's {mAP50, mAP50-95}. This is far more reliable than
+    recomputing, and avoids rebuilding the model (which can mismatch a
+    fine-tuned checkpoint's patch_size/num_classes). Returns None if unavailable.
     """
+    import csv
+    csv_path = OUT / "runs" / "metrics.csv"
+    if not csv_path.is_file():
+        return None
+    rows = list(csv.DictReader(csv_path.read_text().splitlines()))
+    if not rows:
+        return None
+
+    def _get(row, *needles):
+        for k, v in row.items():
+            kl = (k or "").lower().replace(" ", "").replace("-", "_")
+            if all(n in kl for n in needles) and v not in (None, "", "nan", "NaN"):
+                try:
+                    return float(v)
+                except ValueError:
+                    pass
+        return None
+
+    scored = [(_get(r, "map", "50", "95"), r) for r in rows]
+    scored = [(s, r) for s, r in scored if s is not None]
+    if not scored:
+        return None
+    _, best = max(scored, key=lambda t: t[0])
+    m5095 = _get(best, "map", "50", "95")
+    m50 = None
+    for k, v in best.items():
+        kl = (k or "").lower().replace(" ", "").replace("-", "_")
+        if "map" in kl and "50" in kl and "95" not in kl and v not in (None, "", "nan", "NaN"):
+            try:
+                m50 = float(v)
+                break
+            except ValueError:
+                pass
+    if m5095 is None and m50 is None:
+        return None
+    return {"mAP50": round(m50, 4) if m50 is not None else 0.0,
+            "mAP50-95": round(m5095, 4) if m5095 is not None else 0.0,
+            "source": "rfdetr/runs/metrics.csv"}
+
+
+def _compute_metrics(ckpt, ds_root, variant):
+    """Val mAP for the trained model. Prefers the metrics RF-DETR itself logged
+    to runs/metrics.csv; if that is unavailable, falls back to a supervision
+    recompute over the val split. Never crashes — returns zeros + a note only if
+    both paths fail.
+    """
+    try:
+        csv_metrics = _metrics_from_csv()
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"[train] reading runs/metrics.csv failed: {exc}\\n")
+        csv_metrics = None
+    if csv_metrics:
+        print(f"[train] metrics from RF-DETR log: {csv_metrics}", flush=True)
+        return csv_metrics
     try:
         from PIL import Image
         from supervision.metrics import MeanAveragePrecision
@@ -152,15 +232,35 @@ def _compute_metrics(ckpt, ds_root, variant):
         cls = _model_class(variant)
         model = cls(pretrain_weights=str(ckpt))
 
+        # Locate the val images. Trust the dataset's own data.yaml `val:` entry
+        # (that is exactly what RF-DETR used during training), then fall back to
+        # the common YOLO folder layouts. Reading data.yaml fixes the frequent
+        # "no val split found" false-zero when the split is not literally at
+        # valid/images (e.g. val/, images/val, or a data.yaml `path:` root).
         val_dir = None
-        for cand in ("valid/images", "val/images", "validation/images"):
-            if (ds_root / cand).is_dir():
-                val_dir = ds_root / cand
-                break
+        data_yaml = ds_root / "data.yaml"
+        if data_yaml.is_file():
+            doc = yaml.safe_load(data_yaml.read_text()) or {}
+            root = (ds_root / str(doc.get("path", "."))).resolve()
+            val = doc.get("val")
+            for cand in ([val] if isinstance(val, str) else (val or [])):
+                p = (root / str(cand)).resolve()
+                if (p / "images").is_dir():
+                    val_dir = p / "images"
+                    break
+                if p.is_dir():
+                    val_dir = p
+                    break
+        if val_dir is None:
+            for cand in ("valid/images", "val/images", "validation/images"):
+                if (ds_root / cand).is_dir():
+                    val_dir = ds_root / cand
+                    break
         if val_dir is None:
             return {"mAP50": 0.0, "mAP50-95": 0.0,
-                    "note": "no val split found — validate metrics on a GPU host"}
+                    "note": "no val split found — check the dataset's data.yaml `val:` path"}
 
+        # labels sit beside images in YOLO layout (.../images -> .../labels)
         labels_dir = val_dir.parent / "labels"
         images = sorted(p for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.PNG")
                         for p in val_dir.glob(ext))
@@ -288,6 +388,7 @@ def main() -> int:
     # Final progress line + standard report.json (traceability contract).
     _progress(epoch=epochs, total_epochs=epochs, stage="done",
               **{k: v for k, v in m.items() if isinstance(v, (int, float))})
+    classes = _dataset_classes(WORK)
     report = {
         "model": os.environ.get("MODEL_NAME", "model"),
         "job_type": "training",
@@ -299,8 +400,21 @@ def main() -> int:
         "effective_batch": effective,
         "checkpoint": chosen.name,
         "metrics": m,
+        # Traceability: exactly what produced this result, so runs stay
+        # reproducible/comparable (versions, class map, and the config used).
+        "versions": _versions(),
+        "dataset_version": os.environ.get("DATASET_VERSION") or None,
+        "dataset_format": classes.get("dataset_format"),
+        "num_classes": classes.get("num_classes"),
+        "class_names": classes.get("names"),
+        "config_used": cfg,
     }
     (OUT / "report.json").write_text(json.dumps(report, indent=2))
+    # Also drop the exact config that ran, as its own artifact, for auditing.
+    try:
+        (OUT / "config.used.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    except Exception:  # noqa: BLE001 -- never fail the run over an audit artifact
+        pass
     # The container runs as root; RF-DETR/Lightning checkpoints can be written
     # with restrictive perms that block the non-root worker from copying /out to
     # the NAS. Relax /out so every artefact is readable/traversable by the worker.
