@@ -1106,6 +1106,11 @@ class ConfigPublish(BaseModel):
     content: str = Field(..., description="the job-config YAML text")
 
 
+class LatestImageBody(BaseModel):
+    docker_image: str = Field(..., min_length=1, description="full image ref CI just built")
+    commit: Optional[str] = None
+
+
 @app.post("/model-configs/{model}")
 def publish_model_config(model: str, body: ConfigPublish,
                          who: str = Depends(authn.actor("operator"))) -> dict:
@@ -1138,6 +1143,34 @@ def publish_model_config(model: str, body: ConfigPublish,
         raise HTTPException(status_code=503, detail=f"NAS unavailable: {exc}")
     db.add_audit(who, "config.publish", model, source="api")
     return {"model": model, "path": str(target)}
+
+
+@app.post("/models/{model}/latest-image")
+def record_latest_image(model: str, body: LatestImageBody,
+                        who: str = Depends(authn.actor("operator"))) -> dict:
+    """Record the newest image CI built for a model (the 'latest build').
+
+    Called by CI right after it builds + pushes the image. This is what makes
+    'auto/latest' on the Submit form resolve to the newest registry image —
+    even before the model has a trained/registered version.
+    """
+    if not _CONFIG_NAME_RE.match(model):
+        raise HTTPException(status_code=400, detail="invalid model name")
+    try:
+        rec = reg.set_latest_image(model, body.docker_image.strip(),
+                                   commit=body.commit, by=who)
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=f"NAS unavailable: {exc}")
+    db.add_audit(who, "model.latest_image", model, source="api")
+    return {"model": model, **rec}
+
+
+@app.get("/models/{model}/latest-image")
+def get_latest_image_ep(model: str, _: str = Depends(authn.actor("viewer"))) -> dict:
+    rec = reg.get_latest_image(model)
+    if not rec:
+        raise HTTPException(status_code=404, detail="no image recorded for this model")
+    return {"model": model, **rec}
 
 
 @app.get("/audit")

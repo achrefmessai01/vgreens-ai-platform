@@ -149,8 +149,36 @@ def resolve_image(model: str, job_type: str, version: str | None = None) -> str 
         img = _version_image(model, version)
         if img:
             return img
+    # training / "auto": prefer the newest image CI recorded for this model
+    # (the latest build pushed to the registry), then fall back to the latest
+    # registered version's image.
+    li = (get_latest_image(model) or {}).get("docker_image")
+    if li:
+        return li
     lv = latest_version(model)
     return _version_image(model, lv) if lv else None
+
+
+def _latest_image_file(model: str) -> Path:
+    return _model_dir(model) / "latest_image.json"
+
+
+def set_latest_image(model: str, docker_image: str,
+                     commit: str | None = None, by: str | None = None) -> dict:
+    """Record the newest image CI built for this model (the 'latest build').
+    Stored as <model>/latest_image.json; used to resolve 'auto/latest' for
+    training even before the model has any registered version."""
+    _model_dir(model).mkdir(parents=True, exist_ok=True)
+    rec = {"docker_image": docker_image, "commit": commit,
+           "updated_by": by, "updated_at": _now()}
+    _write_atomic(_latest_image_file(model), rec)
+    return rec
+
+
+def get_latest_image(model: str) -> dict | None:
+    """The newest recorded build image for a model, or None if none recorded."""
+    p = _latest_image_file(model)
+    return _read_json(p) or None if p.is_file() else None
 
 
 def _write_atomic(path: Path, data: dict) -> None:

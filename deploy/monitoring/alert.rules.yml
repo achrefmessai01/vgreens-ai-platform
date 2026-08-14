@@ -25,21 +25,23 @@ groups:
           summary: "RabbitMQ metrics endpoint down"
           description: "The broker's Prometheus endpoint is unreachable — jobs cannot be queued/consumed."
 
+      # 15m window so a planned reboot / brief maintenance of the GPU host does
+      # not immediately page critical; a genuinely-down exporter still fires.
       - alert: GPUsNotVisible
         expr: up{job="gpu"} == 0
-        for: 2m
+        for: 15m
         labels: {severity: critical}
         annotations:
           summary: "GPU exporter down / GPUs not visible"
-          description: "The NVIDIA exporter is not reporting — GPUs may be missing or the driver/runtime failed."
+          description: "The NVIDIA exporter has not reported for 15m — GPUs may be missing, the container didn't come back after a reboot (check restart policy / docker on boot), or the driver/runtime failed."
 
       - alert: HostExporterDown
         expr: up{job="node"} == 0
-        for: 2m
+        for: 15m
         labels: {severity: warning}
         annotations:
           summary: "Host node-exporter down"
-          description: "Host metrics are not being collected."
+          description: "Host metrics have not been collected for 15m (brief reboots are tolerated)."
 
       - alert: WorkerStopped
         expr: vgreens_worker_seconds_since_heartbeat > 90

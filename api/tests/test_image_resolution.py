@@ -193,3 +193,32 @@ def test_registry_endpoints_require_auth():
                          ("/registry/resolve", {"ref": "x"}),
                          ("/registry/suggest", {"model": "berry"})]:
         assert client.get(path, params=params).status_code in (401, 403)
+
+
+# ── latest-build image tracking (CI records newest build -> auto resolves it) ──
+def test_latest_image_endpoint_and_resolution():
+    _login()
+    img = "registry.vgreens.lan:9443/vgreens-models/vgreens-model-newmodel:abc123"
+    # CI records the freshly built image (operator token / session)
+    r = client.post("/models/newmodel/latest-image",
+                    json={"docker_image": img, "commit": "abc123"})
+    assert r.status_code == 200, r.text
+    assert client.get("/models/newmodel/latest-image").json()["docker_image"] == img
+    # a training job with a BLANK image now resolves to that recorded build,
+    # even though 'newmodel' has no registered version yet.
+    import db as _db
+    _db.register_backfill_version("nm_ds", "v1", "/nas/nm_ds/v1",
+                                  {"frozen_at": "2026-01-01T00:00:00+00:00"})
+    sub = client.post("/jobs", json={"job_type": "training", "model_name": "newmodel",
+                                     "dataset_name": "nm_ds"})
+    assert sub.status_code == 201, sub.text
+    job = client.get(f"/jobs/{sub.json()['job_id']}").json()
+    assert job["docker_image"] == img
+
+
+def test_latest_image_requires_auth_and_valid_name():
+    client.cookies.clear()
+    assert client.post("/models/x/latest-image",
+                       json={"docker_image": "y:1"}).status_code in (401, 403)
+    _login()
+    assert client.get("/models/never-recorded-xyz/latest-image").status_code == 404
