@@ -87,6 +87,28 @@ CONFIG = Path("/config/job.yaml")
 WORK = Path("/tmp/ds")
 
 
+def _load_cfg():
+    """Resolve the training config. A per-job config mounted at /config/job.yaml
+    wins (per-run override); otherwise fall back to the model's own config baked
+    into the image at /app/configs/ (the committed default). Returns (cfg, source)
+    so the run can record which config it actually used."""
+    if CONFIG.is_file():
+        try:
+            doc = yaml.safe_load(CONFIG.read_text()) or {}
+        except Exception:  # noqa: BLE001
+            doc = {}
+        if doc.get("train"):
+            return doc, "job"
+    try:
+        for p in sorted((Path(__file__).resolve().parent / "configs").glob("*.yaml")):
+            doc = yaml.safe_load(p.read_text()) or {}
+            if doc.get("train"):
+                return doc, "repo"
+    except Exception:  # noqa: BLE001
+        pass
+    return {}, "defaults"
+
+
 def _progress(**row):
     """Append one JSON line to /out/metrics.jsonl (platform live-progress contract).
 
@@ -333,8 +355,9 @@ def main() -> int:
     # predictions/. metrics.jsonl (progress) + report.json are written below.
     for d in ("eval", "artifacts", "predictions"):
         (OUT / d).mkdir(parents=True, exist_ok=True)
-    cfg = yaml.safe_load(CONFIG.read_text()) if CONFIG.is_file() else {}
+    cfg, config_source = _load_cfg()
     t = (cfg or {}).get("train", {})
+    print(f"[train] config source: {config_source}", flush=True)
 
     variant = t.get("model_variant", "base")
     epochs = int(t.get("epochs", 10))
@@ -463,6 +486,7 @@ def main() -> int:
         "num_classes": classes.get("num_classes"),
         "class_names": classes.get("names"),
         "config_used": cfg,
+        "config_source": config_source,
     }
     (OUT / "report.json").write_text(json.dumps(report, indent=2))
     # Also drop the exact config that ran, as its own artifact, for auditing.
@@ -620,6 +644,27 @@ DATA = Path("/data")
 CONFIG = Path("/config/job.yaml")
 
 
+def _load_cfg():
+    """Per-job config mounted at /config/job.yaml wins; otherwise fall back to
+    the model's own config baked into the image at /app/configs/. Returns
+    (cfg, source) so the run records which config it actually used."""
+    if CONFIG.is_file():
+        try:
+            doc = yaml.safe_load(CONFIG.read_text()) or {}
+        except Exception:
+            doc = {}
+        if doc.get("train"):
+            return doc, "job"
+    try:
+        for p in sorted((Path(__file__).resolve().parent / "configs").glob("*.yaml")):
+            doc = yaml.safe_load(p.read_text()) or {}
+            if doc.get("train"):
+                return doc, "repo"
+    except Exception:
+        pass
+    return {}, "defaults"
+
+
 def _progress(**row):
     """Append one JSON line to /out/metrics.jsonl (live-progress contract).
     The dashboard reads epoch/total_epochs/metrics from here while training runs.
@@ -637,10 +682,10 @@ def main() -> int:
     # Standard output structure (platform contract).
     for d in ("eval", "artifacts", "predictions"):
         (OUT / d).mkdir(parents=True, exist_ok=True)
-    cfg = (yaml.safe_load(CONFIG.read_text()) if CONFIG.is_file() else {}) or {}
+    cfg, config_source = _load_cfg()
     epochs = int(cfg.get("train", {}).get("epochs", 5))
     samples = sorted(p for p in DATA.rglob("*") if p.is_file())
-    print(f"[train] epochs={epochs} samples={len(samples)}", flush=True)
+    print(f"[train] config source: {config_source} epochs={epochs} samples={len(samples)}", flush=True)
 
     # ===== REPLACE: build + train your model on the data in /data =====
     # Emit one metrics.jsonl line per epoch so the platform shows live progress.
@@ -660,6 +705,7 @@ def main() -> int:
         "model": __import__("os").environ.get("MODEL_NAME", "model"),
         "job_type": "training", "epochs": epochs,
         "n_samples": len(samples), "metrics": metrics,
+        "config_used": cfg, "config_source": config_source,
     }, indent=2))
     # Container runs as root; relax /out so the non-root worker can copy it to NAS.
     subprocess.run(["chmod", "-R", "a+rwX", "/out"], check=False)
@@ -733,6 +779,8 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 WORKDIR /app
 COPY train.py process.py entrypoint.py /app/
+# Bake the model's default config in, so a job with no Config path falls back to it.
+COPY configs/ /app/configs/
 ENTRYPOINT ["python", "/app/entrypoint.py"]
 """
 
@@ -768,6 +816,8 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 WORKDIR /app
 COPY train.py process.py entrypoint.py /app/
+# Bake the model's default config in, so a job with no Config path falls back to it.
+COPY configs/ /app/configs/
 ENTRYPOINT ["python", "/app/entrypoint.py"]
 """
 
