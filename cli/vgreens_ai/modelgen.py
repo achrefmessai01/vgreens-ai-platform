@@ -71,6 +71,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 # Force MKL's GNU threading layer BEFORE importing torch/rfdetr. The conda base
@@ -100,6 +101,51 @@ def _progress(**row):
             fh.write(json.dumps(row) + "\\n")
     except OSError:
         pass
+
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tail_progress(total_epochs, stop):
+    """While training runs, mirror each new epoch row from RF-DETR's
+    runs/metrics.csv into /out/metrics.jsonl — so the dashboard's progress bar
+    actually advances per epoch instead of jumping start->done. Best-effort:
+    polls every few seconds, only emits rows it hasn't seen, never raises.
+    """
+    import csv as _csv
+    csv_path = OUT / "runs" / "metrics.csv"
+    seen = 0
+    while True:
+        try:
+            if csv_path.is_file():
+                rows = list(_csv.DictReader(csv_path.read_text().splitlines()))
+                for row in rows[seen:]:
+                    line = {"total_epochs": total_epochs, "stage": "epoch"}
+                    for k, v in row.items():
+                        kl = (k or "").lower().replace(" ", "").replace("-", "_")
+                        n = _num(v)
+                        if n is None:
+                            continue
+                        if "epoch" in kl and "epoch" not in line:
+                            line["epoch"] = int(n)
+                        elif "map" in kl and "50" in kl and "95" in kl:
+                            line["mAP50-95"] = round(n, 4)
+                        elif "map" in kl and "50" in kl:
+                            line["mAP50"] = round(n, 4)
+                        elif "loss" in kl and "loss" not in line:
+                            line["loss"] = round(n, 4)
+                    if "epoch" in line:
+                        _progress(**line)
+                seen = len(rows)
+        except Exception:  # noqa: BLE001 — progress mirroring must never break training
+            pass
+        if stop.is_set():
+            return
+        stop.wait(5)
 
 
 # model_variant -> RF-DETR class name
@@ -337,6 +383,13 @@ def main() -> int:
     cls = _model_class(variant)
     model = cls()
 
+    # Live per-epoch progress: rank 0 tails RF-DETR's runs/metrics.csv while
+    # training runs and mirrors each epoch into metrics.jsonl, so the dashboard
+    # bar advances instead of jumping start->done.
+    _stop = threading.Event()
+    if is_main:
+        threading.Thread(target=_tail_progress, args=(epochs, _stop), daemon=True).start()
+
     try:
         model.train(dataset_dir=str(WORK), dataset_file="yolo", epochs=epochs,
                     batch_size=batch_size, grad_accum_steps=grad_accum,
@@ -353,6 +406,8 @@ def main() -> int:
                 f"(was {batch_size} x {grad_accum} = {effective})\\n")
             return 2
         raise
+    finally:
+        _stop.set()
 
     # Under DDP, every rank trains but only rank 0 owns the artefacts. Non-main
     # ranks stop here so the checkpoint, metrics and report are written exactly once.
