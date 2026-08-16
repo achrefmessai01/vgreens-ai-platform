@@ -379,6 +379,7 @@ def main() -> int:
     # Single-GPU runs have no RANK/WORLD_SIZE -> rank 0, world 1 -> unchanged path.
     import time
     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) or 0)
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)) or 0)
     world = int(os.environ.get("WORLD_SIZE", "1") or 1)
     is_main = rank == 0
 
@@ -403,6 +404,13 @@ def main() -> int:
         _progress(epoch=0, total_epochs=epochs, stage="start", world_size=world)
 
     import torch  # imported here, after the MKL env var is set above
+    # Pin THIS rank to its own GPU. Under torchrun each process must bind to a
+    # distinct device (LOCAL_RANK); otherwise every rank defaults to cuda:0 and
+    # the other GPU sits idle. Harmless when world=1 (local_rank=0).
+    if torch.cuda.is_available() and torch.cuda.device_count() > local_rank:
+        torch.cuda.set_device(local_rank)
+        print(f"[train] rank={rank} pinned to cuda:{local_rank} "
+              f"({torch.cuda.get_device_name(local_rank)})", flush=True)
     cls = _model_class(variant)
     model = cls()
 
@@ -416,7 +424,12 @@ def main() -> int:
     try:
         model.train(dataset_dir=str(WORK), dataset_file="yolo", epochs=epochs,
                     batch_size=batch_size, grad_accum_steps=grad_accum,
-                    lr=1e-4, output_dir=str(OUT / "runs"), early_stopping=True)
+                    lr=1e-4, output_dir=str(OUT / "runs"),
+                    # REQUIRED for multi-GPU: under torchrun RF-DETR otherwise runs
+                    # every rank on cuda:0 (issue #242). "auto" makes each process
+                    # use its own GPU. Harmless single-GPU (uses the one device).
+                    devices=("auto" if world > 1 else 1),
+                    early_stopping=True)
     except Exception as exc:
         oom = isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ()))
         if not oom and isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower():
